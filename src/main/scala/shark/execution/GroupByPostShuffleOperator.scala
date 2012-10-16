@@ -20,10 +20,13 @@ import scala.collection.mutable.ArrayBuffer
 import scala.collection.JavaConversions._
 import scala.reflect.BeanProperty
 
-import shark.execution.{HiveTopOperator, ReduceKey}
+import shark.execution.{HiveTopOperator, ReduceKey, DependencyForcerRDD, CoalescedShuffleFetcherRDD,
+  CoalescedShuffleSplit}
 import spark.{Aggregator, HashPartitioner, RDD}
 import spark.rdd.ShuffledAggregatedRDD
+import spark.ShuffleDependency
 import spark.SparkContext._
+import spark.SparkEnv
 
 
 // The final phase of group by.
@@ -166,24 +169,70 @@ with HiveTopOperator {
   }
 
   override def preprocessRdd(rdd: RDD[_]): RDD[_] = {
-    var numReduceTasks = hconf.getIntVar(HiveConf.ConfVars.HADOOPNUMREDUCERS)
-    // If we have no keys, it needs a total aggregation with 1 reducer.
-    if (numReduceTasks < 1 || conf.getKeys.size == 0) numReduceTasks = 1
-
     // We don't use Spark's groupByKey to avoid map-side combiners in Spark.
-    //rdd.asInstanceOf[RDD[(Any, Any)]].groupByKey(numReduceTasks)
+    val maxPartitions = 100  // TODO: make this configurable
+    if (conf.getKeys.size == 0) {
+      // If we have no keys, we need to perform a total aggregation using one reducer.
+      val aggregator = new Aggregator[Any, Any, ArrayBuffer[Any]](
+        GroupByAggregator.createCombiner _,
+        GroupByAggregator.mergeValue _,
+        GroupByAggregator.mergeCombiners _,
+        false)
 
-    // TODO(rxin): Rewrite aggregation logic to integrate it with mergeValue.
-    val aggregator = new Aggregator[Any, Any, ArrayBuffer[Any]](
-      GroupByAggregator.createCombiner _,
-      GroupByAggregator.mergeValue _,
-      GroupByAggregator.mergeCombiners _,
-      false)
+      return new ShuffledAggregatedRDD(
+        rdd.asInstanceOf[RDD[(Any, Any)]],
+        aggregator,
+        new HashPartitioner(1))
+    }
+    // Perform fine-grained pre-partitioning, forcing the ShuffleDependency to be computed but
+    // skipping the shuffle fetching phase.
+    val NUM_FINE_GRAINED_BUCKETS = maxPartitions
+    val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
+    val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
+    val dep = new ShuffleDependency[Any, Any, Any](pairRdd, None, part)
+    val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
+    rdd.context.runJob(depForcer, (iter: Iterator[_]) => {})
 
-    new ShuffledAggregatedRDD(
-      rdd.asInstanceOf[RDD[(Any, Any)]],
-      aggregator,
-      new HashPartitioner(numReduceTasks))
+    // Collect the partition sizes
+    val mapOutputTracker = SparkEnv.get.mapOutputTracker
+    val partitionSizes = 0.until(NUM_FINE_GRAINED_BUCKETS).map(
+      mapOutputTracker.getServerStatuses(dep.shuffleId, _).map(_._2).sum)
+    logInfo("Computed fine-grained shuffle partitions with sizes: " + partitionSizes)
+
+    // Mke a partitioning decision based on statistics.
+    // For now, we'll use a simple heuristic based on the total data set size,
+    // which aims to keep the amount of data per partition above a static threshold.
+    val MIN_BYTES_PER_PARTITION = 32 * 1024 * 1024 // 32 megabytes  TODO: make this configurable
+    val totalDataSetSize = partitionSizes.sum
+    logInfo("Total data set size is: " + totalDataSetSize)
+
+    val numCoalescedPartitions = math.min(math.round(math.ceil(1.0 * totalDataSetSize / MIN_BYTES_PER_PARTITION)),
+      maxPartitions).toInt
+    logInfo("Coalescing " + NUM_FINE_GRAINED_BUCKETS + " fine-grained partitions into " +
+      numCoalescedPartitions + " partitions")
+
+    // Form $n$ sublists, assigning to them in round-robin fashion.
+    // From http://stackoverflow.com/questions/11132788/
+    def round[T](l: List[T], n: Int): List[List[T]] =
+      (0 until n).map{ i => l.drop(i).sliding(1, n).flatten.toList }.toList
+
+    val groups = round(0.until(NUM_FINE_GRAINED_BUCKETS).toList, numCoalescedPartitions)
+    val groupedSplits = groups.zipWithIndex.map(x => new CoalescedShuffleSplit(x._2, x._1.toArray)).toArray
+
+    // This RDD will fetch the coalesced partitions
+    val coalesced = new CoalescedShuffleFetcherRDD[Any, Any, Any](pairRdd, dep, groupedSplits)
+    coalesced.mapPartitions(iter => {
+      val combiners = new JHashMap[Any, ArrayBuffer[Any]]
+      for ((k, v) <- iter) {
+        val oldC = combiners.get(k)
+        if (oldC == null) {
+          combiners.put(k, GroupByAggregator.createCombiner(v))
+        } else {
+          combiners.put(k, GroupByAggregator.mergeValue(oldC, v))
+        }
+      }
+      combiners.iterator
+    })
   }
 
   override def processPartition(split: Int, iter: Iterator[_]) = {
