@@ -13,12 +13,15 @@ import scala.collection.mutable.ArrayBuffer
 import scala.collection.JavaConversions._
 import scala.reflect.BeanProperty
 
-import spark.{CoGroupedRDD, HashPartitioner, RDD}
+import shark.LogHelper
+import spark.SparkEnv
+import spark.{HashPartitioner, RDD, Split}
+import spark.ShuffleDependency
 import spark.SparkContext._
 
 
 class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
-  with HiveTopOperator {
+  with HiveTopOperator with LogHelper {
 
   @BeanProperty var valueTableDescMap: JHashMap[Int, TableDesc] = _
   @BeanProperty var keyTableDesc: TableDesc = _
@@ -26,6 +29,10 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
   @transient var tagToValueSer: JHashMap[Int, Deserializer] = _
   @transient var keyDeserializer: Deserializer = _
   @transient var keyObjectInspector: StandardStructObjectInspector = _
+
+  val NUM_FINE_GRAINED_BUCKETS = 100
+  val SMALL_TABLE_SIZE = 32 * 1024 * 1024
+  val MIN_BYTES_PER_PARTITION = 32 * 1024 * 1024
 
   override def initializeOnMaster() {
     super.initializeOnMaster()
@@ -64,6 +71,22 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     combineMultipleRdds(inputRdds)
   }
 
+  def runPartialDag(rdd: RDD[_]): (ShuffleDependency[Any, Any, Any], IndexedSeq[Long]) = {
+    val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
+    val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
+    val dep = new ShuffleDependency[Any, Any, Any](pairRdd, None, part)
+    val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
+    depForcer.forceEvaluate()
+
+    // Collect the partition sizes
+    val mapOutputTracker = SparkEnv.get.mapOutputTracker
+    val partitionSizes = 0.until(NUM_FINE_GRAINED_BUCKETS).map(
+      mapOutputTracker.getServerStatuses(dep.shuffleId, _).map(_._2).sum)
+    logInfo("Computed fine-grained shuffle partitions with sizes: " + partitionSizes)
+
+    (dep, partitionSizes)
+  }
+
   override def combineMultipleRdds(rdds: Seq[(Int, RDD[_])]): RDD[_] = {
     // Determine the number of reduce tasks to run.
     var numReduceTasks = hconf.getIntVar(HiveConf.ConfVars.HADOOPNUMREDUCERS)
@@ -80,13 +103,59 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
       logError("rdds.size (%d) != rddsJavaMap.size (%d)".format(rdds.size, rddsJavaMap.size))
     })
 
-    val rddsInJoinOrder = order.map { inputIndex =>
+    val rddsInJoinOrder: Seq[RDD[(ReduceKey, Any)]] = order.map { inputIndex =>
       rddsJavaMap.get(inputIndex.byteValue.toInt).asInstanceOf[RDD[(ReduceKey, Any)]]
-    }
+    }.toSeq
 
-    val part = new HashPartitioner(numReduceTasks)
+    // Force execute the DAG before the join.
+    val rddRuns = rddsInJoinOrder.map(runPartialDag)
+    println("-------------------------------------------------------------")
+    println(rddRuns)
+
+    // Size of the join inputs.
+    val inputSizes = rddRuns.map { rddRun => rddRun._2.sum }
+    println(inputSizes)
+
+    val smallTables = inputSizes.zipWithIndex.filter(_._1 < SMALL_TABLE_SIZE)
+    if (smallTables.size >= numTables - 1) {
+      // TODO: There are enough small tables. Use broadcast join.
+      cogroupJoin(rddsInJoinOrder, rddRuns)
+    } else {
+      cogroupJoin(rddsInJoinOrder, rddRuns)
+    }
+  }
+
+  def cogroupJoin(
+    rddsInJoinOrder: Seq[RDD[(ReduceKey, Any)]],
+    rddRuns: Seq[(ShuffleDependency[Any, Any, Any], IndexedSeq[Long])]): RDD[_] = {
+
+    // Use normal shuffle join.
+    val inputSizes = rddRuns.map { rddRun => rddRun._2.sum }
+    val totalDataSetSize = inputSizes.sum
+    val numCoalescedPartitions = math.min(
+      math.round(math.ceil(1.0 * totalDataSetSize / MIN_BYTES_PER_PARTITION)),
+      NUM_FINE_GRAINED_BUCKETS).toInt
+
+    // Form $n$ sublists, assigning to them in round-robin fashion.
+    // From http://stackoverflow.com/questions/11132788/
+    def round[T](l: List[T], n: Int): List[List[T]] =
+      (0 until n).map{ i => l.drop(i).sliding(1, n).flatten.toList }.toList
+
+    val deps: Seq[ShuffleDependency[Any, Any, Any]] = rddRuns.map(_._1)
+    val cogroupDeps: Seq[CoGroupSplitDep] = deps.map(d => new ShuffleCoGroupSplitDep(d.shuffleId))
+
+    val groups = round(0.until(NUM_FINE_GRAINED_BUCKETS).toList, numCoalescedPartitions)
+    val groupedSplits = groups.zipWithIndex.map { case(group, index) =>
+      new CoGroupSplit(index, cogroupDeps, group.toArray) : Split
+    }.toArray
+
+    println("----------------------------------------------------------------")
+    println("numCoalescedPartitions: " + numCoalescedPartitions)
+    println("num groups: " + groups.size)
+
+    val part = new HashPartitioner(numCoalescedPartitions)
     val cogrouped = new CoGroupedRDD[ReduceKey](
-      rddsInJoinOrder.toSeq.asInstanceOf[Seq[RDD[(_, _)]]], part)
+      rddsInJoinOrder.asInstanceOf[Seq[RDD[(_, _)]]], part, groupedSplits, deps.toList)
 
     val op = OperatorSerializationWrapper(this)
 

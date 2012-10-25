@@ -191,7 +191,7 @@ with HiveTopOperator {
     val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
     val dep = new ShuffleDependency[Any, Any, Any](pairRdd, None, part)
     val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
-    rdd.context.runJob(depForcer, (iter: Iterator[_]) => {})
+    depForcer.forceEvaluate()
 
     // Collect the partition sizes
     val mapOutputTracker = SparkEnv.get.mapOutputTracker
