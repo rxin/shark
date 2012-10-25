@@ -1,30 +1,31 @@
 package shark.execution
 
-import spark._
-import collection.mutable.ArrayBuffer
+import spark.RDD
+import spark.ShuffleDependency
+import spark.SparkEnv
+import spark.Split
+
 
 class CoalescedShuffleSplit(
     val index: Int,
     val partitions: Array[Int])
   extends Split
 
-class CoalescedShuffleFetcherRDD[K, V, C](
-    prev: RDD[(K, C)],
-    dep: ShuffleDependency[K, V, C],
+class CoalescedShuffleFetcherRDD[K, V](
+    prev: RDD[(K, V)],
+    dep: ShuffleDependency[K, V],
     coalescedPartitions: Array[CoalescedShuffleSplit])
-    extends RDD[(K, C)](prev.context) {
+    extends RDD[(K, V)](prev.context) {
 
     override def splits = coalescedPartitions.asInstanceOf[Array[Split]]
 
     override val dependencies = List(dep)
 
     override def compute(split: Split) = {
+      // TODO: fix
       val fetcher = SparkEnv.get.shuffleFetcher
       split.asInstanceOf[CoalescedShuffleSplit].partitions.flatMap(part => {
-        val buf = new ArrayBuffer[(K, C)]
-        def addTupleToBuffer(k: K, c: C) = { buf += Tuple(k, c) }
-        fetcher.fetch[K, C](dep.shuffleId, part, addTupleToBuffer)
-        buf.iterator
+        fetcher.fetch[K, V](dep.shuffleId, part)
       }).iterator
     }
 

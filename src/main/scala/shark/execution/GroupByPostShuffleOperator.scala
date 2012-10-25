@@ -23,10 +23,11 @@ import scala.reflect.BeanProperty
 import shark.execution.{HiveTopOperator, ReduceKey, DependencyForcerRDD, CoalescedShuffleFetcherRDD,
   CoalescedShuffleSplit}
 import spark.{Aggregator, HashPartitioner, RDD}
-import spark.rdd.ShuffledAggregatedRDD
 import spark.ShuffleDependency
 import spark.SparkContext._
 import spark.SparkEnv
+import spark.rdd.ShuffledRDD
+
 
 
 // The final phase of group by.
@@ -176,20 +177,18 @@ with HiveTopOperator {
       val aggregator = new Aggregator[Any, Any, ArrayBuffer[Any]](
         GroupByAggregator.createCombiner _,
         GroupByAggregator.mergeValue _,
-        GroupByAggregator.mergeCombiners _,
-        false)
+        GroupByAggregator.mergeCombiners _)
 
-      return new ShuffledAggregatedRDD(
+      return new ShuffledRDD(
         rdd.asInstanceOf[RDD[(Any, Any)]],
-        aggregator,
-        new HashPartitioner(1))
+        new HashPartitioner(1)).mapPartitions(aggregator.combineValuesByKey)
     }
     // Perform fine-grained pre-partitioning, forcing the ShuffleDependency to be computed but
     // skipping the shuffle fetching phase.
     val NUM_FINE_GRAINED_BUCKETS = maxPartitions
     val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
     val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
-    val dep = new ShuffleDependency[Any, Any, Any](pairRdd, None, part)
+    val dep = new ShuffleDependency[Any, Any](pairRdd, part)
     val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
     rdd.context.runJob(depForcer, (iter: Iterator[_]) => {})
 
@@ -220,7 +219,7 @@ with HiveTopOperator {
     val groupedSplits = groups.zipWithIndex.map(x => new CoalescedShuffleSplit(x._2, x._1.toArray)).toArray
 
     // This RDD will fetch the coalesced partitions
-    val coalesced = new CoalescedShuffleFetcherRDD[Any, Any, Any](pairRdd, dep, groupedSplits)
+    val coalesced = new CoalescedShuffleFetcherRDD(pairRdd, dep, groupedSplits)
     coalesced.mapPartitions(iter => {
       val combiners = new JHashMap[Any, ArrayBuffer[Any]]
       for ((k, v) <- iter) {
