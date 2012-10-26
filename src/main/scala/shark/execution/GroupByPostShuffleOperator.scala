@@ -27,6 +27,7 @@ import spark.ShuffleDependency
 import spark.SparkContext._
 import spark.SparkEnv
 import spark.rdd.ShuffledRDD
+import spark.CountPartitionStatAccumulator
 
 
 
@@ -188,24 +189,28 @@ with HiveTopOperator {
     val NUM_FINE_GRAINED_BUCKETS = maxPartitions
     val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
     val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
-    val dep = new ShuffleDependency[Any, Any](pairRdd, part)
+    val dep = new ShuffleDependency[Any, Any](pairRdd, part,
+      Some(new CountPartitionStatAccumulator(NUM_FINE_GRAINED_BUCKETS)))
     val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
     rdd.context.runJob(depForcer, (iter: Iterator[_]) => {})
 
     // Collect the partition sizes
     val mapOutputTracker = SparkEnv.get.mapOutputTracker
-    val partitionSizes = 0.until(NUM_FINE_GRAINED_BUCKETS).map(
-      mapOutputTracker.getServerStatuses(dep.shuffleId, _).map(_._2).sum)
-    logInfo("Computed fine-grained shuffle partitions with sizes: " + partitionSizes)
+    val statuses = 0.until(NUM_FINE_GRAINED_BUCKETS).map(mapOutputTracker.getServerStatuses(dep.shuffleId, _))
+    val partitionBytes = statuses.map(_.map(_.size).sum)
+    val partitionRecords = statuses.map(_.map(_.customStats.get.asInstanceOf[Int]).sum)
+    logInfo("Computed fine-grained shuffle partitions with bytes: " + partitionBytes + " and record counts: " +
+      partitionRecords)
 
     // Mke a partitioning decision based on statistics.
     // For now, we'll use a simple heuristic based on the total data set size,
     // which aims to keep the amount of data per partition above a static threshold.
     val MIN_BYTES_PER_PARTITION = 32 * 1024 * 1024 // 32 megabytes  TODO: make this configurable
-    val totalDataSetSize = partitionSizes.sum
-    logInfo("Total data set size is: " + totalDataSetSize)
+    val totalBytes = partitionBytes.sum
+    val totalRecords = partitionRecords.sum
+    logInfo("Total data set is " + totalBytes + " bytes and " + totalRecords + " records")
 
-    val numCoalescedPartitions = math.min(math.round(math.ceil(1.0 * totalDataSetSize / MIN_BYTES_PER_PARTITION)),
+    val numCoalescedPartitions = math.min(math.round(math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)),
       maxPartitions).toInt
     logInfo("Coalescing " + NUM_FINE_GRAINED_BUCKETS + " fine-grained partitions into " +
       numCoalescedPartitions + " partitions")
