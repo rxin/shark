@@ -28,6 +28,7 @@ import spark.SparkContext._
 import spark.SparkEnv
 import spark.rdd.ShuffledRDD
 import spark.CountPartitionStatAccumulator
+import spark.PartitionStatsAccumulator
 
 
 
@@ -189,38 +190,45 @@ with HiveTopOperator {
     val NUM_FINE_GRAINED_BUCKETS = maxPartitions
     val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
     val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
-    val dep = new ShuffleDependency[Any, Any](pairRdd, part,
-      Some(new CountPartitionStatAccumulator(NUM_FINE_GRAINED_BUCKETS)))
+    val countStatAccumulator = new CountPartitionStatAccumulator(NUM_FINE_GRAINED_BUCKETS)
+    val dep = new ShuffleDependency[Any, Any](pairRdd, part, Some(countStatAccumulator))
     val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
     rdd.context.runJob(depForcer, (iter: Iterator[_]) => {})
 
-    // Collect the partition sizes
+    // Collect the partition statuses
     val mapOutputTracker = SparkEnv.get.mapOutputTracker
-    val statuses = 0.until(NUM_FINE_GRAINED_BUCKETS).map(mapOutputTracker.getServerStatuses(dep.shuffleId, _))
-    val partitionBytes = statuses.map(_.map(_.size).sum)
-    val partitionRecords = statuses.map(_.map(_.customStats.get.asInstanceOf[Int]).sum)
-    logInfo("Computed fine-grained shuffle partitions with bytes: " + partitionBytes + " and record counts: " +
-      partitionRecords)
+    val statuses = 0.until(NUM_FINE_GRAINED_BUCKETS).map(
+      mapOutputTracker.getServerStatuses(dep.shuffleId, _).filter(x => x.size != 0))
 
-    // Mke a partitioning decision based on statistics.
+    // Aggregate each partition's statistics, filtering out empty partitions
+    val partitionStats = for {
+      partition <- statuses
+      bytes = partition.map(_.size).sum
+      if (bytes != 0)
+      // Here, I use mergeStats just to illustrate how we could generalize the
+      // aggregation of statistics, in preparation for factoring this out into
+      // its own plan-choice RDD.
+      accumulator = countStatAccumulator.asInstanceOf[PartitionStatsAccumulator[_, Any]]
+      records = partition.map(_.customStats.get).reduce(accumulator.mergeStats)
+      reduceId = partition(0).reduceId
+    } yield (reduceId, bytes, records)
+    logInfo("Computed fine-grained shuffle partitions with bytes: " + partitionStats.map(_._2) +
+            " and record counts: " + partitionStats.map(_._3))
+
+    // Make a partitioning decision based on statistics.
     // For now, we'll use a simple heuristic based on the total data set size,
     // which aims to keep the amount of data per partition above a static threshold.
     val MIN_BYTES_PER_PARTITION = 32 * 1024 * 1024 // 32 megabytes  TODO: make this configurable
-    val totalBytes = partitionBytes.sum
-    val totalRecords = partitionRecords.sum
+    val totalBytes = partitionStats.map(_._2).sum
+    val totalRecords = partitionStats.map(_._3.asInstanceOf[Int]).sum
     logInfo("Total data set is " + totalBytes + " bytes and " + totalRecords + " records")
 
     val numCoalescedPartitions = math.min(math.round(math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)),
       maxPartitions).toInt
-    logInfo("Coalescing " + NUM_FINE_GRAINED_BUCKETS + " fine-grained partitions into " +
+    val maxPartitionsPerTask = math.round(math.ceil(1.0 * partitionStats.length / numCoalescedPartitions)).toInt
+    logInfo("Coalescing " + partitionStats.length + " fine-grained partitions into " +
       numCoalescedPartitions + " partitions")
-
-    // Form $n$ sublists, assigning to them in round-robin fashion.
-    // From http://stackoverflow.com/questions/11132788/
-    def round[T](l: List[T], n: Int): List[List[T]] =
-      (0 until n).map{ i => l.drop(i).sliding(1, n).flatten.toList }.toList
-
-    val groups = round(0.until(NUM_FINE_GRAINED_BUCKETS).toList, numCoalescedPartitions)
+    val groups = partitionStats.map(_._1).toList.grouped(maxPartitionsPerTask)
     val groupedSplits = groups.zipWithIndex.map(x => new CoalescedShuffleSplit(x._2, x._1.toArray)).toArray
 
     // This RDD will fetch the coalesced partitions
