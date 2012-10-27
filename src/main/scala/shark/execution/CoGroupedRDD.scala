@@ -14,45 +14,23 @@ case class NarrowCoGroupSplitDep(rdd: RDD[_], split: Split) extends CoGroupSplit
 case class ShuffleCoGroupSplitDep(shuffleId: Int) extends CoGroupSplitDep
 
 
-class CoGroupSplit(idx: Int, val deps: Seq[CoGroupSplitDep]) extends Split with Serializable {
+
+class CoGroupSplit(
+  idx: Int,
+  val deps: Seq[CoGroupSplitDep],
+  val partitions: Array[Int])
+extends Split with Serializable {
+
   override val index: Int = idx
   override def hashCode(): Int = idx
 }
 
-class CoGroupedRDD[K](@transient rdds: Seq[RDD[(_, _)]], part: Partitioner)
+class CoGroupedRDD[K](
+    @transient rdds: Seq[RDD[(_, _)]],
+    part: Partitioner,
+    @transient splits_ : Array[Split],
+    @transient val dependencies: List[Dependency[_]])
   extends RDD[(K, Array[ArrayBuffer[Any]])](rdds.head.context) with Logging {
-
-  @transient
-  override val dependencies = {
-    val deps = new ArrayBuffer[Dependency[_]]
-    for ((rdd, index) <- rdds.zipWithIndex) {
-      if (rdd.partitioner == Some(part)) {
-        logInfo("Adding one-to-one dependency with " + rdd)
-        deps += new OneToOneDependency(rdd)
-      } else {
-        logInfo("Adding shuffle dependency with " + rdd)
-        deps += new ShuffleDependency[Any, Any](rdd, part)
-      }
-    }
-    deps.toList
-  }
-
-  @transient
-  val splits_ : Array[Split] = {
-    val firstRdd = rdds.head
-    val array = new Array[Split](part.numPartitions)
-    for (i <- 0 until array.size) {
-      array(i) = new CoGroupSplit(i, rdds.zipWithIndex.map { case (r, j) =>
-        dependencies(j) match {
-          case s: ShuffleDependency[_, _] =>
-            new ShuffleCoGroupSplitDep(s.shuffleId): CoGroupSplitDep
-          case _ =>
-            new NarrowCoGroupSplitDep(r, r.splits(i)): CoGroupSplitDep
-        }
-      }.toList)
-    }
-    array
-  }
 
   override def splits = splits_
 
@@ -75,13 +53,14 @@ class CoGroupedRDD[K](@transient rdds: Seq[RDD[(_, _)]], part: Partitioner)
     for ((dep, depNum) <- split.deps.zipWithIndex) dep match {
       case NarrowCoGroupSplitDep(rdd, itsSplit) => {
         // Read them from the parent
-        for ((k, v) <- rdd.iterator(itsSplit)) { getSeq(k.asInstanceOf[K])(depNum) += v }
+        for ((k, v) <- rdd.iterator(itsSplit)) {
+          getSeq(k.asInstanceOf[K])(depNum) += v
+        }
       }
       case ShuffleCoGroupSplitDep(shuffleId) => {
-        // Read map outputs of shuffle
-        def mergePair(k: K, v: Any) { getSeq(k)(depNum) += v }
-        val fetcher = SparkEnv.get.shuffleFetcher
-        fetcher.fetch[K, Any](shuffleId, split.index).foreach(x => mergePair(x._1, x._2))
+        BlockFetcher.fetchMultiple[K, Any](shuffleId, split.partitions).foreach { case(k, v) =>
+          getSeq(k)(depNum) += v
+        }
       }
     }
     map.iterator

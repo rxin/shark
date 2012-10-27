@@ -19,4 +19,8 @@ class DependencyForcerRDD[T: ClassManifest](prev: RDD[T], deps: List[Dependency[
   override val dependencies = deps
   override def compute(split: Split) = null
   override def preferredLocations(split: Split) = Nil
+
+  def forceEvaluate() {
+    context.runJob(this, (iter: Iterator[_]) => {})
+  }
 }
