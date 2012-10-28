@@ -1,8 +1,5 @@
 package shark.execution
 
-import scala.collection.mutable.HashMap
-import scala.collection.immutable.Map
-
 import spark._
 import shark.Utils
 

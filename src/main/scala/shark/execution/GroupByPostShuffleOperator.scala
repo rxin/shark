@@ -22,8 +22,10 @@ import scala.collection.JavaConversions._
 import scala.reflect.BeanProperty
 import scala.math.Ordering.Implicits._
 
+import shark.SharkConfVars
 import shark.execution.{HiveTopOperator, ReduceKey, DependencyForcerRDD, CoalescedShuffleFetcherRDD,
   CoalescedShuffleSplit}
+
 import spark.{Aggregator, HashPartitioner, RDD}
 import spark.ShuffleDependency
 import spark.SparkContext._
@@ -174,7 +176,6 @@ with HiveTopOperator {
 
   override def preprocessRdd(rdd: RDD[_]): RDD[_] = {
     // We don't use Spark's groupByKey to avoid map-side combiners in Spark.
-    val maxPartitions = 100  // TODO: make this configurable
     if (conf.getKeys.size == 0) {
       // If we have no keys, we need to perform a total aggregation using one reducer.
       val aggregator = new Aggregator[Any, Any, ArrayBuffer[Any]](
@@ -188,13 +189,13 @@ with HiveTopOperator {
     }
     // Perform fine-grained pre-partitioning, forcing the ShuffleDependency to be computed but
     // skipping the shuffle fetching phase.
-    val NUM_FINE_GRAINED_BUCKETS = maxPartitions
+    val NUM_FINE_GRAINED_BUCKETS = SharkConfVars.getIntVar(hconf, SharkConfVars.GROUP_BY_NUM_FINE_GRAINED_BUCKETS)
     val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
     val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
     val countStatAccumulator = new CountPartitionStatAccumulator(NUM_FINE_GRAINED_BUCKETS)
     val dep = new ShuffleDependency[Any, Any](pairRdd, part, Some(countStatAccumulator))
     val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
-    rdd.context.runJob(depForcer, (iter: Iterator[_]) => {})
+    depForcer.forceEvaluate()
 
     // Collect the partition statuses
     val mapOutputTracker = SparkEnv.get.mapOutputTracker
@@ -217,15 +218,14 @@ with HiveTopOperator {
             " and record counts: " + partitionStats.map(_._3))
 
     // Make a partitioning decision based on statistics.
-    // For now, we'll use a simple heuristic based on the total data set size,
-    // which aims to keep the amount of data per partition above a static threshold.
-    val MIN_BYTES_PER_PARTITION = 32 * 1024 * 1024 // 32 megabytes  TODO: make this configurable
+    // For now, we'll use a simple heuristic based on the total number of tuples,
+    // which aims to keep the number of tuples per partition above a static threshold.
+    val MIN_BYTES_PER_PARTITION = SharkConfVars.getIntVar(hconf, SharkConfVars.GROUP_BY_MIN_BYTES_PER_REDUCER)
     val totalBytes = partitionStats.map(_._2).sum
     val totalRecords = partitionStats.map(_._3.asInstanceOf[Int]).sum
     logInfo("Total data set is " + totalBytes + " bytes and " + totalRecords + " records")
 
-    val numCoalescedPartitions = math.min(math.round(math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)),
-      maxPartitions).toInt
+    val numCoalescedPartitions = math.min(math.round(math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)), NUM_FINE_GRAINED_BUCKETS).toInt
     logInfo("Coalescing " + partitionStats.length + " fine-grained partitions into " +
       numCoalescedPartitions + " partitions")
     // TODO: this method is becoming large; this partitioning code should eventually be factored out into its own method
