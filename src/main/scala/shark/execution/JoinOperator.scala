@@ -15,7 +15,7 @@ import scala.reflect.BeanProperty
 
 import spark.{CoGroupedRDD, HashPartitioner, RDD}
 import spark.SparkContext._
-import spark.BlockFetcher
+import spark.SparkEnv
 import shark.SharkEnv
 import shark.Utils
 import spark.ShuffleDependency
@@ -143,6 +143,7 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     logInfo("Executing broadcast join (auto converted).")
 
     // Collect the small tables.
+    val fetcher = SparkEnv.get.shuffleFetcher
     val broadcastedTables =
       rddRuns.zipWithIndex.filter(_._2 != bigTableIndex).foreach { case(rddRun, index) =>
         if (index == bigTableIndex) {
@@ -152,7 +153,7 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
           val shuffleId = dep.shuffleId
           val table = new ArrayBuffer[(ReduceKey, Any)]
 
-          BlockFetcher.fetchMultiple[ReduceKey, Any](
+          fetcher.fetchMultiple[ReduceKey, Any](
             shuffleId, Array.range(0, NUM_FINE_GRAINED_BUCKETS)).foreach { pair =>
             table += pair
           }

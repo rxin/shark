@@ -50,6 +50,7 @@ class CoGroupedRDD[K](
       }
       values
     }
+    val fetcher = SparkEnv.get.shuffleFetcher
     for ((dep, depNum) <- split.deps.zipWithIndex) dep match {
       case NarrowCoGroupSplitDep(rdd, itsSplit) => {
         // Read them from the parent
@@ -58,7 +59,7 @@ class CoGroupedRDD[K](
         }
       }
       case ShuffleCoGroupSplitDep(shuffleId) => {
-        BlockFetcher.fetchMultiple[K, Any](shuffleId, split.partitions).foreach { case(k, v) =>
+        fetcher.fetchMultiple[K, Any](shuffleId, split.partitions).foreach { case(k, v) =>
           getSeq(k)(depNum) += v
         }
       }
