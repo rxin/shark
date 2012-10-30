@@ -22,11 +22,9 @@ class CoalescedShuffleFetcherRDD[K, V](
     override val dependencies = List(dep)
 
     override def compute(split: Split) = {
-      // TODO: fix
       val fetcher = SparkEnv.get.shuffleFetcher
-      split.asInstanceOf[CoalescedShuffleSplit].partitions.flatMap(part => {
-        fetcher.fetch[K, V](dep.shuffleId, part)
-      }).iterator
+      val reduceIds = split.asInstanceOf[CoalescedShuffleSplit].partitions
+      fetcher.fetchMultiple(dep.shuffleId, reduceIds)
     }
 
     override def preferredLocations(split: Split) = Nil
