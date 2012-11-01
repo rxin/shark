@@ -33,12 +33,16 @@ object SharkConfVars {
   // If true, then query plans are compressed before being sent
   val COMPRESS_QUERY_PLAN = new ConfVar("shark.compressQueryPlan", true)
 
+  // If true, partial DAG execution is used during the groupBy phase.
+  // If false, the number of reducers is controlled by "
+  val GROUP_BY_USE_PARTIAL_DAG = new ConfVar("shark.groupBy.usePartialDag", true)
+
   // The minimum number of bytes per reduce partition, used to control the degree
-  // of parallelism in groupBy's shuffle phase.
+  // of parallelism in groupBy's partial DAG shuffle phase.
   val GROUP_BY_MIN_BYTES_PER_REDUCER = new ConfVar("shark.groupBy.minBytesPerReducer", 32 * 1024 * 1024)
 
-  // The number of fine-grained buckets to use during groupBy's fine-grained
-  // hash partitioning phase.
+  // The number of fine-grained buckets to use during groupBy's
+  // partial DAG hash partitioning phase.
   val GROUP_BY_NUM_FINE_GRAINED_BUCKETS = new ConfVar("shark.groupBy.numFineGrainedBuckets", 1024)
 
   // Use reflection to discover all ConfVar fields defined in this class
