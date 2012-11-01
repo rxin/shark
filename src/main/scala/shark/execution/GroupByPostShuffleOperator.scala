@@ -203,7 +203,7 @@ with HiveTopOperator {
       mapOutputTracker.getServerStatuses(dep.shuffleId, _).filter(x => x.size != 0))
 
     // Aggregate each partition's statistics, filtering out empty partitions
-    val partitionStats = for {
+    val partitionStats: Seq[(Int, Long, Any)] = for {
       partition <- statuses
       bytes = partition.map(_.size).sum
       if (bytes != 0)
@@ -218,8 +218,8 @@ with HiveTopOperator {
             " and record counts: " + partitionStats.map(_._3))
 
     // Make a partitioning decision based on statistics.
-    // For now, we'll use a simple heuristic based on the total number of tuples,
-    // which aims to keep the number of tuples per partition above a static threshold.
+    // For now, we'll use a simple heuristic based on the total data set size,
+    // which aims to keep the number of bytes per partition above a static threshold.
     val MIN_BYTES_PER_PARTITION = SharkConfVars.getIntVar(hconf, SharkConfVars.GROUP_BY_MIN_BYTES_PER_REDUCER)
     val totalBytes = partitionStats.map(_._2).sum
     val totalRecords = partitionStats.map(_._3.asInstanceOf[Int]).sum
@@ -228,23 +228,14 @@ with HiveTopOperator {
     val numCoalescedPartitions = math.min(math.round(math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)), NUM_FINE_GRAINED_BUCKETS).toInt
     logInfo("Coalescing " + partitionStats.length + " fine-grained partitions into " +
       numCoalescedPartitions + " partitions")
-    // TODO: this method is becoming large; this partitioning code should eventually be factored out into its own method
     /* We can attempt to mitigate skew by achieving an even partitioning of the reduce partitions.  Finding the optimal
      * solution is NP-complete, so we will use a greedy heuristic to find a decent (but possibly non-optimal) solution.
      *
      * For now, we're attempting to equalize the size of the partitions (in bytes).  More generally, we want to equalize
      * the partition processing costs, which may be some more complex function of the partition's data statistics.
      */
-    val groupOrdering = implicitly[Ordering[(Long, ArrayBuffer[Int])]].reverse
-    val groups = PriorityQueue[(Long, ArrayBuffer[Int])]()(groupOrdering)
-    1.to(numCoalescedPartitions).foreach(x => groups.enqueue((0L, ArrayBuffer[Int]())))
-    for (partition <- partitionStats.sortBy(- _._2)) {
-      // In decreasing order of cost, assign each partition to the reducer with the lowest total partition cost.
-      val (cost, assignedPartitions) = groups.dequeue()
-      assignedPartitions.append(partition._1) // reduceId
-      groups.enqueue((cost + partition._2, assignedPartitions))
-    }
-    val groupedSplits = groups.map(_._2).zipWithIndex.map(x => new CoalescedShuffleSplit(x._2, x._1.toArray)).toArray
+    val groups = BinPacker.packBins[Int](numCoalescedPartitions, partitionStats.map(x => (x._2, x._1)))
+    val groupedSplits = groups.zipWithIndex.map(x => new CoalescedShuffleSplit(x._2, x._1.toArray)).toArray
 
     // This RDD will fetch the coalesced partitions
     val coalesced = new CoalescedShuffleFetcherRDD(pairRdd, dep, groupedSplits)
@@ -387,4 +378,24 @@ object GroupByAggregator {
   def createCombiner(v: Any) = ArrayBuffer(v)
   def mergeValue(buf: ArrayBuffer[Any], v: Any) = buf += v
   def mergeCombiners(b1: ArrayBuffer[Any], b2: ArrayBuffer[Any]) = b1 ++= b2
+}
+
+object BinPacker {
+  /**
+   * Greedily pack bins.  In increasing order of cost, assigns each item to the bin with the lowest total cost.
+   * @param nBins the number of bins
+   * @param items a list of (cost, item) pairs
+   * @return a list of items grouped into bins.
+   */
+  def packBins[T](nBins: Int, items: Seq[(Long, T)]): Seq[Seq[T]] = {
+    val groupOrdering = Ordering.by[(Long, ArrayBuffer[T]), Long](_._1).reverse
+    val groups = PriorityQueue[(Long, ArrayBuffer[T])]()(groupOrdering)
+    1.to(nBins).foreach(x => groups.enqueue((0L, ArrayBuffer[T]())))
+    for (partition <- items.sortBy(- _._1)) {
+      val (cost, assignedItems) = groups.dequeue()
+      assignedItems.append(partition._2)
+      groups.enqueue((cost + partition._1, assignedItems))
+    }
+    groups.toSeq.map(_._2)
+  }
 }
