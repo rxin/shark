@@ -227,16 +227,24 @@ with HiveTopOperator {
             " and record counts: " + partitionStats.map(_._3))
     endTime = System.currentTimeMillis()
     logInfo("Aggregated statistics in " + (endTime - startTime) + " ms")
-
-    // Make a partitioning decision based on statistics.
-    // For now, we'll use a simple heuristic based on the total data set size,
-    // which aims to keep the number of bytes per partition above a static threshold.
-    val MIN_BYTES_PER_PARTITION = SharkConfVars.getIntVar(hconf, SharkConfVars.GROUP_BY_MIN_BYTES_PER_REDUCER)
     val totalBytes = partitionStats.map(_._2).sum
     val totalRecords = partitionStats.map(_._3.asInstanceOf[Int]).sum
     logInfo("Total data set is " + totalBytes + " bytes and " + totalRecords + " records")
 
-    val numCoalescedPartitions = math.min(math.round(math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)), NUM_FINE_GRAINED_BUCKETS).toInt
+    // Make a partitioning decision based on statistics.
+    val numCoalescedPartitions = {
+      val heuristic = SharkConfVars.getVar(hconf, SharkConfVars.GROUP_BY_PARALLELISM_HEURISTIC)
+      if (heuristic == "fixedNumber") {
+        hadoopNumReducers
+      } else if (heuristic == "bytesPerReducer") {
+        // Heuristic based on the total data set size, which aims to keep the number of bytes per partition
+        // above a static threshold.
+        val MIN_BYTES_PER_PARTITION = SharkConfVars.getIntVar(hconf, SharkConfVars.GROUP_BY_MIN_BYTES_PER_REDUCER)
+        math.min(math.round(math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)), NUM_FINE_GRAINED_BUCKETS).toInt
+      } else {
+        throw new IllegalArgumentException("Invalid heuristic: " + heuristic)
+      }
+    }
     logInfo("Coalescing " + partitionStats.length + " fine-grained partitions into " +
       numCoalescedPartitions + " partitions")
     startTime = System.currentTimeMillis()

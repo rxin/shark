@@ -34,8 +34,13 @@ object SharkConfVars {
   val COMPRESS_QUERY_PLAN = new ConfVar("shark.compressQueryPlan", true)
 
   // If true, partial DAG execution is used during the groupBy phase.
-  // If false, the number of reducers is controlled by "
+  // If false, the number of reducers is controlled by 'mapred.reduce.tasks'
   val GROUP_BY_USE_PARTIAL_DAG = new ConfVar("shark.groupBy.usePartialDag", true)
+
+  // Choose the heuristic used to choose the degree of parallelism in groupBy when using
+  // partial DAG mode.  Valid settings are 'bytesPerReducer' and 'fixedNumber'.
+  // Under 'fixedNumber' mode, the number of reducers is set by 'mapred.reduce.tasks'
+  val GROUP_BY_PARALLELISM_HEURISTIC = new ConfVar("shark.groupBy.parallelismHeuristic", "bytesPerReducer")
 
   // The minimum number of bytes per reduce partition, used to control the degree
   // of parallelism in groupBy's partial DAG shuffle phase.
