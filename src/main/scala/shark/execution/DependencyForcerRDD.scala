@@ -20,7 +20,8 @@ class DependencyForcerRDD[T: ClassManifest](prev: RDD[T], deps: List[Dependency[
   override def compute(split: Split) = null
   override def preferredLocations(split: Split) = Nil
 
-  def forceEvaluate() {
-    context.runJob(this, (iter: Iterator[_]) => {})
+  // Force evaluate the RDD and return the number of map tasks.
+  def forceEvaluate(): Int = {
+    context.runJob(this, (iter: Iterator[_]) => {}).size
   }
 }

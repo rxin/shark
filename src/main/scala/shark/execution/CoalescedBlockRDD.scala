@@ -6,23 +6,19 @@ import shark.Utils
 
 // index is the map id. location is the slave node that has the block.
 class CoalescedBlockSplit(
-  val index: Int, val location: String) extends Split
+  val index: Int, val location: String, val numMapOutputs: Int) extends Split
 
-class CoalescedBlockRDD[T: ClassManifest](
-    sc: SparkContext,
-    val shuffleId: Int,
-    val numMapTasks: Int,
-    val numMapOutputs: Int)
+class CoalescedBlockRDD[T: ClassManifest](sc: SparkContext, val shuffleId: Int)
   extends RDD[T](sc) {
 
   @transient
   val _splits : Array[Split] = {
-    // Use the first reduce block to get the preferred location for a given map task.
-    val testingBlocks = Array.tabulate(numMapTasks)(mapId => "shuffle_%d_%d_%d".format(
-      shuffleId, mapId, 0))
-    val locations: Array[Seq[String]] = SparkEnv.get.blockManager.getLocations(testingBlocks)
+    val mapOutputTracker = SparkEnv.get.mapOutputTracker
+    val mapStatuses = mapOutputTracker.getServerStatuses(shuffleId)
 
-    Array.tabulate(numMapTasks)(mapId => new CoalescedBlockSplit(mapId, locations(mapId).head))
+    mapStatuses.zipWithIndex.map { case(mapStatus, mapId) =>
+      new CoalescedBlockSplit(mapId, mapStatus.address.ip, mapStatus.compressedSizes.size)
+    }
   }
 
   override def splits = _splits
@@ -34,6 +30,7 @@ class CoalescedBlockRDD[T: ClassManifest](
   override val dependencies: List[Dependency[_]] = Nil
 
   override def compute(split: Split): Iterator[T] = {
+    val numMapOutputs = split.asInstanceOf[CoalescedBlockSplit].numMapOutputs
     val mapId = split.index
     val blockManager = SparkEnv.get.blockManager
     (0 until numMapOutputs).iterator.flatMap { reduceId: Int =>

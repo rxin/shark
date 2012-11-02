@@ -25,6 +25,7 @@ import spark.CoGroupSplitDep
 import spark.ShuffleCoGroupSplitDep
 import spark.Split
 import spark.CoGroupSplit
+import spark.broadcast.Broadcast
 
 
 class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
@@ -78,12 +79,13 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     combineMultipleRdds(inputRdds)
   }
 
-  def runPartialDag(rdd: RDD[_]): (ShuffleDependency[Any, Any], IndexedSeq[Long]) = {
+  // return value: the dependency, compressed size, and number of map tasks.
+  def runPartialDag(rdd: RDD[_]): (ShuffleDependency[Any, Any], IndexedSeq[Long], Int) = {
     val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
     val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
     val dep = new ShuffleDependency[Any, Any](pairRdd, part)
     val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
-    depForcer.forceEvaluate()
+    val numMapTasks = depForcer.forceEvaluate()
 
     // Collect the partition sizes
     val mapOutputTracker = SparkEnv.get.mapOutputTracker
@@ -92,7 +94,7 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     }
     logInfo("Computed fine-grained shuffle partitions with sizes: " + partitionSizes)
 
-    (dep, partitionSizes)
+    (dep, partitionSizes, numMapTasks)
   }
 
   override def combineMultipleRdds(rdds: Seq[(Int, RDD[_])]): RDD[_] = {
@@ -118,17 +120,18 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     // Force execute the DAG before the join.
     val rddRuns = rddsInJoinOrder.map(runPartialDag)
     println("-------------------------------------------------------------")
-    println(rddRuns)
+    println(rddRuns.toSeq)
 
     // Size of the join inputs.
     val inputSizes = rddRuns.map { rddRun => rddRun._2.sum }
-    println(inputSizes)
+    logInfo("Input table sizes: " + inputSizes.toSeq)
 
     val autoConvertMapJoin: Boolean = hconf.getBoolVar(HiveConf.ConfVars.HIVECONVERTJOIN)
     val smallTables = inputSizes.zipWithIndex.filter(_._1 < SMALL_TABLE_SIZE)
+
     if (autoConvertMapJoin && smallTables.size >= numTables - 1) {
-      // TODO: There are enough small tables. Use broadcast join.
-      cogroupJoin(rddsInJoinOrder, rddRuns)
+      val bigTableIndex = inputSizes.zipWithIndex.max._2
+      broadcastJoin(rddsInJoinOrder, rddRuns, bigTableIndex)
     } else {
       cogroupJoin(rddsInJoinOrder, rddRuns)
     }
@@ -136,43 +139,91 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
 
   def broadcastJoin(
     rddsInJoinOrder: Seq[RDD[(ReduceKey, Any)]],
-    rddRuns: Seq[(ShuffleDependency[Any, Any], IndexedSeq[Long])],
-    numMapTasks: Int,
+    rddRuns: Seq[(ShuffleDependency[Any, Any], IndexedSeq[Long], Int)],
     bigTableIndex: Int): RDD[_] = {
 
     logInfo("Executing broadcast join (auto converted).")
 
     // Collect the small tables.
     val fetcher = SparkEnv.get.shuffleFetcher
-    val broadcastedTables =
-      rddRuns.zipWithIndex.filter(_._2 != bigTableIndex).foreach { case(rddRun, index) =>
-        if (index == bigTableIndex) {
-          null
-        } else {
-          val dep = rddRun._1
-          val shuffleId = dep.shuffleId
-          val table = new ArrayBuffer[(ReduceKey, Any)]
+    val broadcastedTables: Seq[(Broadcast[ArrayBuffer[(ReduceKey, Any)]], Int)] =
+      rddRuns.zipWithIndex.filter(_._2 != bigTableIndex).map { case(rddRun, index) =>
+        val dep = rddRun._1
+        val shuffleId = dep.shuffleId
+        val table = new ArrayBuffer[(ReduceKey, Any)]
 
-          fetcher.fetchMultiple[ReduceKey, Any](
-            shuffleId, Array.range(0, NUM_FINE_GRAINED_BUCKETS)).foreach { pair =>
-            table += pair
-          }
-          SharkEnv.sc.broadcast(table)
+        val startTime = System.currentTimeMillis()
+        fetcher.fetchMultiple[ReduceKey, Any](
+          shuffleId, Array.range(0, NUM_FINE_GRAINED_BUCKETS)).foreach { pair =>
+          table += pair
+        }
+        val endTime = System.currentTimeMillis()
+
+        logInfo("Fetching table (size: %d) took %d ms".format(
+          rddRun._2.sum, endTime - startTime))
+
+        (SharkEnv.sc.broadcast(table), index)
+      }
+
+    val bigTableRdd = new CoalescedBlockRDD[(ReduceKey, Any)](
+      rddsInJoinOrder(bigTableIndex).context,
+      rddRuns(bigTableIndex)._1.shuffleId)
+
+    val op = OperatorSerializationWrapper(this)
+    val numRdds = numTables
+
+    bigTableRdd.mapPartitions { part =>
+
+      val map = new JHashMap[ReduceKey, Array[ArrayBuffer[Any]]]
+      def getSeq(k: ReduceKey): Array[ArrayBuffer[Any]] = {
+        var values = map.get(k)
+        if (values == null) {
+          values = Array.fill(numRdds)(new ArrayBuffer[Any])
+          map.put(k, values)
+        }
+        values
+      }
+
+      broadcastedTables.foreach { case(table, tableIndex) =>
+        table.value.foreach { case(key, value) =>
+          getSeq(key)(tableIndex) += value
         }
       }
 
-    val bigTableRdd = new CoalescedBlockRDD(
-      rddsInJoinOrder(bigTableIndex).context,
-      rddRuns(bigTableIndex)._1.shuffleId,
-      numMapTasks,
-      NUM_FINE_GRAINED_BUCKETS)
+      part.foreach { case(key: ReduceKey, value: Any) => getSeq(key)(bigTableIndex) += value }
 
-    bigTableRdd
+      op.initializeOnSlave()
+
+      val tmp = new Array[Object](2)
+      val writable = new BytesWritable
+      val nullSafes = op.conf.getNullSafes()
+
+      val cp = new CartesianProduct[Any](op.numTables)
+
+      map.iterator.flatMap { case (k: ReduceKey, bufs: Array[_]) =>
+        writable.set(k.bytes)
+
+        // If nullCheck is false, we can skip deserializing the key.
+        if (op.nullCheck &&
+            SerDeUtils.hasAnyNullObject(
+              op.keyDeserializer.deserialize(writable).asInstanceOf[JList[_]],
+              op.keyObjectInspector,
+              nullSafes)) {
+          bufs.zipWithIndex.flatMap { case (buf, label) =>
+            val bufsNull = Array.fill(op.numTables)(ArrayBuffer[Any]())
+            bufsNull(label) = buf
+            op.generateTuples(cp.product(bufsNull.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+          }
+        } else {
+          op.generateTuples(cp.product(bufs.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+        }
+      }
+    }
   }
 
   def cogroupJoin(
     rddsInJoinOrder: Seq[RDD[(ReduceKey, Any)]],
-    rddRuns: Seq[(ShuffleDependency[Any, Any], IndexedSeq[Long])]): RDD[_] = {
+    rddRuns: Seq[(ShuffleDependency[Any, Any], IndexedSeq[Long], Int)]): RDD[_] = {
 
     logInfo("Executing shuffle join")
 
@@ -197,7 +248,6 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     println("----------------------------------------------------------------")
     println("numCoalescedPartitions: " + numCoalescedPartitions)
     println("num groups: " + groups.size)
-
 
     val part = new HashPartitioner(numCoalescedPartitions)
     val cogrouped = new CoGroupedRDD[ReduceKey](
