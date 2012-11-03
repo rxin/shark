@@ -248,15 +248,26 @@ with HiveTopOperator {
     logInfo("Coalescing " + partitionStats.length + " fine-grained partitions into " +
       numCoalescedPartitions + " partitions")
     startTime = System.currentTimeMillis()
-    /* We can attempt to mitigate skew by achieving an even partitioning of the reduce partitions.  Finding the optimal
-     * solution is NP-complete, so we will use a greedy heuristic to find a decent (but possibly non-optimal) solution.
-     *
-     * For now, we're attempting to equalize the size of the partitions (in bytes).  More generally, we want to equalize
-     * the partition processing costs, which may be some more complex function of the partition's data statistics.
-     */
-    val groups = BinPacker.packBins[Int](numCoalescedPartitions, partitionStats.map(x => (x._2, x._1)))
+    val groups = {
+      if (SharkConfVars.getBoolVar(hconf, SharkConfVars.GROUP_BY_USE_BIN_PACKING)) {
+        /* We can attempt to mitigate skew by achieving an even partitioning of the reduce partitions.  Finding the
+         * optimal solution is NP-complete, so we will use a greedy heuristic to find a decent(but possibly non-optimal)
+         * solution.
+         *
+         * For now, we're attempting to equalize the size of the partitions (in bytes).  More generally, we want to
+         * equalize the partition processing costs, which may be a function of each partition's data statistics.
+         */
+        logInfo("Grouping partitions using bin-packing")
+        BinPacker.packBins[Int](numCoalescedPartitions, partitionStats.map(x => (x._2, x._1)))
+      } else {
+
+        logInfo("Grouping partitions using grouped()")
+        val numReduceOutputsPerPartition = math.ceil( NUM_FINE_GRAINED_BUCKETS.toDouble / numCoalescedPartitions).toInt
+        (0 until NUM_FINE_GRAINED_BUCKETS).grouped(numReduceOutputsPerPartition).toIndexedSeq
+      }
+    }
     endTime = System.currentTimeMillis()
-    logInfo("Computed bin-packing in " + (endTime - startTime) + " ms")
+    logInfo("Computed partition groups in " + (endTime - startTime) + " ms")
     val groupedSplits = groups.zipWithIndex.map(x => new CoalescedShuffleSplit(x._2, x._1.toArray)).toArray
 
     // This RDD will fetch the coalesced partitions

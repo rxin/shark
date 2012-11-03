@@ -50,6 +50,10 @@ object SharkConfVars {
   // partial DAG hash partitioning phase.
   val GROUP_BY_NUM_FINE_GRAINED_BUCKETS = new ConfVar("shark.groupBy.numFineGrainedBuckets", 1024)
 
+  // If true, fine-grained group by partitions will be bin-packed using a heuristic
+  // (only applies when shark.groupBy.usePartialDag is enabled.
+  val GROUP_BY_USE_BIN_PACKING = new ConfVar("shark.groupBy.useBinPacking", true)
+
   // Use reflection to discover all ConfVar fields defined in this class
   private def allConfVars: Array[ConfVar] = {
     val confVarFields = SharkConfVars.getClass.getDeclaredFields.filter(_.getType() == classOf[ConfVar])
