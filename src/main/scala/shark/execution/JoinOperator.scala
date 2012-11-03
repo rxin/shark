@@ -39,7 +39,6 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
   @transient var keyObjectInspector: StandardStructObjectInspector = _
 
   val NUM_FINE_GRAINED_BUCKETS = 100
-  val SMALL_TABLE_SIZE = 32 * 1024 * 1024
   val MIN_BYTES_PER_PARTITION = 32 * 1024 * 1024
 
   override def initializeOnMaster() {
@@ -127,7 +126,11 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     logInfo("Input table sizes: " + inputSizes.toSeq)
 
     val autoConvertMapJoin: Boolean = hconf.getBoolVar(HiveConf.ConfVars.HIVECONVERTJOIN)
-    val smallTables = inputSizes.zipWithIndex.filter(_._1 < SMALL_TABLE_SIZE)
+
+    val smallTableSize: Long = hconf.getLongVar(HiveConf.ConfVars.HIVESMALLTABLESFILESIZE)
+    val smallTables = inputSizes.zipWithIndex.filter(_._1 < smallTableSize)
+    logInfo("Converting to map join if table is smaller than " +
+      Utils.memoryBytesToString(smallTableSize))
 
     if (autoConvertMapJoin && smallTables.size >= numTables - 1) {
       val bigTableIndex = inputSizes.zipWithIndex.max._2
