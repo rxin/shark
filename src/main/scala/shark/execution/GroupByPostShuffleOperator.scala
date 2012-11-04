@@ -258,12 +258,16 @@ with HiveTopOperator {
          * equalize the partition processing costs, which may be a function of each partition's data statistics.
          */
         logInfo("Grouping partitions using bin-packing")
-        BinPacker.packBins[Int](numCoalescedPartitions, partitionStats.map(x => (x._2, x._1)))
+        val bins = BinPacker.packBins[Int](numCoalescedPartitions, partitionStats.map(x => (x._2, x._1)))
+        logInfo("Group costs are " + bins.map(_._1).sorted.toIndexedSeq)
+        bins.map(_._2)
       } else {
 
         logInfo("Grouping partitions using grouped()")
         val numReduceOutputsPerPartition = math.ceil( NUM_FINE_GRAINED_BUCKETS.toDouble / numCoalescedPartitions).toInt
-        (0 until NUM_FINE_GRAINED_BUCKETS).grouped(numReduceOutputsPerPartition).toIndexedSeq
+        val groups = partitionStats.map(x => (x._2, x._1)).grouped(numReduceOutputsPerPartition).toIndexedSeq
+        logInfo("Group costs are " + groups.map(_.map(_._1).sum).sorted)
+        groups.map(_.map(_._2))
       }
     }
     endTime = System.currentTimeMillis()
@@ -407,9 +411,9 @@ object BinPacker {
    * Greedily pack bins.  In increasing order of cost, assigns each item to the bin with the lowest total cost.
    * @param nBins the number of bins
    * @param items a list of (cost, item) pairs
-   * @return a list of items grouped into bins.
+   * @return a list of (groupCost, groupItem) pairs, representing the grouping.
    */
-  def packBins[T](nBins: Int, items: Seq[(Long, T)]): Seq[Seq[T]] = {
+  def packBins[T](nBins: Int, items: Seq[(Long, T)]): Seq[(Long, Seq[T])] = {
     val groupOrdering = Ordering.by[(Long, ArrayBuffer[T]), Long](_._1).reverse
     val groups = PriorityQueue[(Long, ArrayBuffer[T])]()(groupOrdering)
     1.to(nBins).foreach(x => groups.enqueue((0L, ArrayBuffer[T]())))
@@ -418,6 +422,6 @@ object BinPacker {
       assignedItems.append(partition._2)
       groups.enqueue((cost + partition._1, assignedItems))
     }
-    groups.toSeq.map(_._2)
+    groups.toSeq
   }
 }
