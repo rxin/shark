@@ -13,11 +13,13 @@ class CoalescedShuffleSplit(
 
 class CoalescedShuffleFetcherRDD[K, V](
     prev: RDD[(K, V)],
-    dep: ShuffleDependency[K, V],
-    coalescedPartitions: Array[CoalescedShuffleSplit])
-    extends RDD[(K, V)](prev.context) {
+    groups: Array[Array[Int]],
+    dep: ShuffleDependency[K, V])
+  extends RDD[(K, V)](prev.context) {
 
-    override def splits = coalescedPartitions.asInstanceOf[Array[Split]]
+    override def splits = groups.zipWithIndex.map { case (group, index) =>
+      new CoalescedShuffleSplit(index, group)
+    }
 
     override val dependencies = List(dep)
 

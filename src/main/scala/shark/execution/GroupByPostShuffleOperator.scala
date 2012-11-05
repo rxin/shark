@@ -23,8 +23,7 @@ import scala.reflect.BeanProperty
 import scala.math.Ordering.Implicits._
 
 import shark.SharkConfVars
-import shark.execution.{HiveTopOperator, ReduceKey, DependencyForcerRDD, CoalescedShuffleFetcherRDD,
-  CoalescedShuffleSplit}
+import shark.execution.{HiveTopOperator, ReduceKey, DependencyForcerRDD, CoalescedShuffleFetcherRDD}
 
 import spark.{Aggregator, HashPartitioner, RDD}
 import spark.ShuffleDependency
@@ -178,58 +177,35 @@ with HiveTopOperator {
     // If partial DAG is disabled or we have no keys, use the old group by code:
     // We don't use Spark's groupByKey to avoid map-side combiners in Spark.
     val hadoopNumReducers = hconf.getIntVar(HiveConf.ConfVars.HADOOPNUMREDUCERS)
-    if (conf.getKeys.size == 0 || !(SharkConfVars.getBoolVar(hconf, SharkConfVars.GROUP_BY_USE_PARTIAL_DAG))) {
+    val usePartialDag = SharkConfVars.getBoolVar(hconf, SharkConfVars.GROUP_BY_USE_PARTIAL_DAG)
+
+    if (conf.getKeys.size == 0 || !usePartialDag) {
+      // If partial DAG is disabled, use the old groupBy code:
+      // Perform fine-grained pre-partitioning, forcing the ShuffleDependency to be computed but
+      // skipping the shuffle fetching phase.
       val numReducers =
         if (hadoopNumReducers < 1 || conf.getKeys.size == 0)
           1   // If we have no keys, we need to perform a total aggregation using one reducer.
         else
           hadoopNumReducers
+
       return new ShuffledRDD(
         rdd.asInstanceOf[RDD[(Any, Any)]],
         new HashPartitioner(numReducers)).mapPartitions(GroupByAggregator.combineValuesByKey)
     }
-    // If partial DAG is disabled, use the old groupBy code:
-    // Perform fine-grained pre-partitioning, forcing the ShuffleDependency to be computed but
-    // skipping the shuffle fetching phase.
-    val NUM_FINE_GRAINED_BUCKETS = SharkConfVars.getIntVar(hconf, SharkConfVars.GROUP_BY_NUM_FINE_GRAINED_BUCKETS)
+
+    val NUM_FINE_GRAINED_BUCKETS = SharkConfVars.getIntVar(hconf,
+      SharkConfVars.GROUP_BY_NUM_FINE_GRAINED_BUCKETS)
     val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
     val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
-    val countStatAccumulator = new CountPartitionStatAccumulator(NUM_FINE_GRAINED_BUCKETS)
-    val dep = new ShuffleDependency[Any, Any](pairRdd, part, Some(countStatAccumulator))
-    val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
-    var startTime = System.currentTimeMillis()
-    depForcer.forceEvaluate()
-    var endTime = System.currentTimeMillis()
-    logInfo("Forced shuffle evaluation took " + (endTime - startTime) + " ms")
 
-    // Collect the partition statuses
-    startTime = System.currentTimeMillis()
-    val mapOutputTracker = SparkEnv.get.mapOutputTracker
-    val statuses = 0.until(NUM_FINE_GRAINED_BUCKETS).map(
-      mapOutputTracker.getServerStatuses(dep.shuffleId, _).filter(x => x.size != 0))
-    endTime = System.currentTimeMillis()
-    logInfo("Collected map output statuses in " + (endTime - startTime) + " ms")
+    val preshuffleResult = pairRdd.preshuffle(part, CountPartitionStatAccumulator)
 
-    // Aggregate each partition's statistics, filtering out empty partitions
-    startTime = System.currentTimeMillis()
-    val partitionStats: Seq[(Int, Long, Any)] = for {
-      partition <- statuses
-      bytes = partition.map(_.size).sum
-      if (bytes != 0)
-      // Here, I use mergeStats just to illustrate how we could generalize the
-      // aggregation of statistics, in preparation for factoring this out into
-      // its own plan-choice RDD.
-      accumulator = countStatAccumulator.asInstanceOf[PartitionStatsAccumulator[_, Any]]
-      records = partition.map(_.customStats.get).reduce(accumulator.mergeStats)
-      reduceId = partition(0).reduceId
-    } yield (reduceId, bytes, records)
-    logInfo("Computed fine-grained shuffle partitions with bytes: " + partitionStats.map(_._2) +
-            " and record counts: " + partitionStats.map(_._3))
-    endTime = System.currentTimeMillis()
-    logInfo("Aggregated statistics in " + (endTime - startTime) + " ms")
-    val totalBytes = partitionStats.map(_._2).sum
-    val totalRecords = partitionStats.map(_._3.asInstanceOf[Int]).sum
-    logInfo("Total data set is " + totalBytes + " bytes and " + totalRecords + " records")
+    val totalBytes = preshuffleResult.sizes.sum
+    logInfo("Aggregated size: %d bytes".format(totalBytes))
+    logInfo("Fine grained partition sizes: " + preshuffleResult.sizes.toSeq)
+    logInfo("Aggregated records: " + preshuffleResult.customStats.sum)
+    logInfo("Fine grained records: " + preshuffleResult.customStats.toSeq)
 
     // Make a partitioning decision based on statistics.
     val numCoalescedPartitions = {
@@ -237,45 +213,40 @@ with HiveTopOperator {
       if (heuristic == "fixedNumber") {
         hadoopNumReducers
       } else if (heuristic == "bytesPerReducer") {
-        // Heuristic based on the total data set size, which aims to keep the number of bytes per partition
-        // above a static threshold.
-        val MIN_BYTES_PER_PARTITION = SharkConfVars.getIntVar(hconf, SharkConfVars.GROUP_BY_MIN_BYTES_PER_REDUCER)
-        math.min(math.round(math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)), NUM_FINE_GRAINED_BUCKETS).toInt
+        // Heuristic based on the total data set size, which aims to keep the number of bytes
+        // per partition above a static threshold.
+        val MIN_BYTES_PER_PARTITION = SharkConfVars.getIntVar(
+          hconf, SharkConfVars.GROUP_BY_MIN_BYTES_PER_REDUCER)
+        math.min(math.round(
+          math.ceil(1.0 * totalBytes / MIN_BYTES_PER_PARTITION)), NUM_FINE_GRAINED_BUCKETS).toInt
       } else {
         throw new IllegalArgumentException("Invalid heuristic: " + heuristic)
       }
     }
-    logInfo("Coalescing " + partitionStats.length + " fine-grained partitions into " +
+    logInfo("Coalescing " + NUM_FINE_GRAINED_BUCKETS + " fine-grained partitions into " +
       numCoalescedPartitions + " partitions")
-    startTime = System.currentTimeMillis()
-    val groups = {
+    val startTimeCoalescing = System.currentTimeMillis()
+    val groups: Array[Array[Int]] = {
       if (SharkConfVars.getBoolVar(hconf, SharkConfVars.GROUP_BY_USE_BIN_PACKING)) {
-        /* We can attempt to mitigate skew by achieving an even partitioning of the reduce partitions.  Finding the
-         * optimal solution is NP-complete, so we will use a greedy heuristic to find a decent(but possibly non-optimal)
-         * solution.
-         *
-         * For now, we're attempting to equalize the size of the partitions (in bytes).  More generally, we want to
-         * equalize the partition processing costs, which may be a function of each partition's data statistics.
-         */
         logInfo("Grouping partitions using bin-packing")
-        val bins = BinPacker.packBins[Int](numCoalescedPartitions, partitionStats.map(x => (x._2, x._1)))
+        val nonEmptyPartitions = preshuffleResult.sizes.zipWithIndex.filter(_._1 != 0)
+        val bins = BinPacker.packBins[Int](numCoalescedPartitions, nonEmptyPartitions)
         logInfo("Group costs are " + bins.map(_._1).sorted.toIndexedSeq)
-        bins.map(_._2)
+        bins.map(_._2.toArray).toArray
       } else {
-
         logInfo("Grouping partitions using grouped()")
-        val numReduceOutputsPerPartition = math.ceil( NUM_FINE_GRAINED_BUCKETS.toDouble / numCoalescedPartitions).toInt
-        val groups = partitionStats.map(x => (x._2, x._1)).grouped(numReduceOutputsPerPartition).toIndexedSeq
-        logInfo("Group costs are " + groups.map(_.map(_._1).sum).sorted)
+        val numReduceOutputsPerPartition = math.ceil(
+          NUM_FINE_GRAINED_BUCKETS.toDouble / numCoalescedPartitions).toInt
+        val groups = preshuffleResult.sizes.zipWithIndex.grouped(
+          numReduceOutputsPerPartition).toArray
+        logInfo("Group costs are " + groups.map(_.map(_._1).sum).sorted.toIndexedSeq)
         groups.map(_.map(_._2))
       }
     }
-    endTime = System.currentTimeMillis()
-    logInfo("Computed partition groups in " + (endTime - startTime) + " ms")
-    val groupedSplits = groups.zipWithIndex.map(x => new CoalescedShuffleSplit(x._2, x._1.toArray)).toArray
+    logInfo("Computed groups in " + (System.currentTimeMillis - startTimeCoalescing) + " ms")
 
     // This RDD will fetch the coalesced partitions
-    val coalesced = new CoalescedShuffleFetcherRDD(pairRdd, dep, groupedSplits)
+    val coalesced = new CoalescedShuffleFetcherRDD(pairRdd, groups, preshuffleResult.dep)
     coalesced.mapPartitions(GroupByAggregator.combineValuesByKey)
   }
 
