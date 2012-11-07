@@ -218,7 +218,12 @@ class SharkCliDriver extends CliDriver with LogHelper {
     val tokens: Array[String] = cmd_trimmed.split("\\s+")
     val cmd_1: String = cmd_trimmed.substring(tokens(0).length()).trim()
     var ret = 0
-    if (cmd_trimmed.toLowerCase().equals("quit") ||
+
+    if (cmd_trimmed.toLowerCase().startsWith("clear-shuffle ")) {
+      val numTasks = cmd_trimmed.toLowerCase().replace("clear-shuffle ", "").toInt
+      Utils.removeShuffleData(numTasks)
+      return ret
+    } else if (cmd_trimmed.toLowerCase().equals("quit") ||
       cmd_trimmed.toLowerCase().equals("exit") ||
       tokens(0).equalsIgnoreCase("source") ||
       cmd_trimmed.startsWith("!") ||

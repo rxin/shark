@@ -29,4 +29,34 @@ object Utils {
     "%.1f %s".formatLocal(Locale.US, value, unit)
   }
 
+  /**
+   * A hack to remove all shuffle data from block manager.
+   */
+  def removeShuffleData(numTasks: Int) {
+    import scala.collection.JavaConversions._
+    SharkEnv.sc.parallelize(0 until numTasks, numTasks).foreach { task =>
+      spark.SparkEnv.get.shuffleBlocks.synchronized {
+        val shuffleBlocks = spark.SparkEnv.get.shuffleBlocks
+        val blockManager = spark.SparkEnv.get.blockManager
+
+        shuffleBlocks.foreach { case(shuffleId, info) =>
+          val numMapOutputs: Int = info._1
+          val mapIds: collection.mutable.ArrayBuffer[Int] = info._2
+
+          var i = 0
+          while (i < mapIds.size) {
+            var j = 0
+            while (j < numMapOutputs) {
+              blockManager.drop("shuffle_" + shuffleId + "_" + mapIds(i) + "_" + j)
+              j += 1
+            }
+            i += 1
+          }
+        }
+
+        shuffleBlocks.clear()
+      }
+    }
+  }
+
 }
