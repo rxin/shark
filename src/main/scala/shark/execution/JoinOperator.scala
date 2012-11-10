@@ -79,24 +79,6 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     combineMultipleRdds(inputRdds)
   }
 
-  // return value: the dependency, compressed size, and number of map tasks.
-  def runPartialDag(rdd: RDD[_]): (ShuffleDependency[Any, Any], IndexedSeq[Long], Int) = {
-    val part = new HashPartitioner(NUM_REDUCERS)
-    val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
-    val dep = new ShuffleDependency[Any, Any](pairRdd, part)
-    val depForcer = new DependencyForcerRDD(pairRdd, List(dep))
-    val numMapTasks = depForcer.forceEvaluate()
-
-    // Collect the partition sizes
-    val mapOutputTracker = SparkEnv.get.mapOutputTracker
-    val partitionSizes = 0.until(NUM_REDUCERS).map { reduceId =>
-      mapOutputTracker.getServerStatuses(dep.shuffleId, reduceId).map(_.size).sum
-    }
-    logInfo("Computed fine-grained shuffle partitions with sizes: " + partitionSizes)
-
-    (dep, partitionSizes, numMapTasks)
-  }
-
   override def combineMultipleRdds(rdds: Seq[(Int, RDD[_])]): RDD[_] = {
     // Turn the RDD into a map. Use a Java HashMap to avoid Scala's annoying
     // Some/Option. Add an assert for sanity check. If ReduceSink's join tags
