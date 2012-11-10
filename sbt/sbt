@@ -1,3 +1,4 @@
+#!/bin/bash
 SHARK_CONF_DIR=`dirname $0`/../conf
 if [ -e $SHARK_CONF_DIR/shark-env.sh ] ; then
    . $SHARK_CONF_DIR/shark-env.sh

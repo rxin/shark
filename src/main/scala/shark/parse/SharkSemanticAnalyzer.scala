@@ -145,7 +145,14 @@ class SharkSemanticAnalyzer(conf: HiveConf) extends SemanticAnalyzer(conf) with 
       // destination (e.g. CTAS with table property "shark.cache" = "true").
       val terminalOp = {
         if (isCTAS && qb.getTableDesc != null && shouldCache) {
-          OperatorFactory.createSharkCacheOutputPlan(hiveSinkOps.head, qb.getTableDesc.getTableName)
+          // TODO: Clean this up ?
+          // Partition this table with the same partitions as another existing table 
+          val coPartitionTableName = qb.getTableDesc.getTblProps().getOrElse(
+            "shark.copartition.table", "")
+          val partitionColName = qb.getTableDesc.getTblProps().getOrElse(
+            "shark.partition.col", "")
+          OperatorFactory.createSharkCacheOutputPlan(hiveSinkOps.head, qb.getTableDesc.getTableName,
+            coPartitionTableName, partitionColName)
         } else if (pctx.getContext().asInstanceOf[QueryContext].useTableRddSink) {
           OperatorFactory.createSharkRddOutputPlan(hiveSinkOps.head)
         } else {

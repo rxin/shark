@@ -23,10 +23,14 @@ object OperatorFactory extends LogHelper {
   }
 
   def createSharkCacheOutputPlan(
-    hiveTerminalOp: HiveOperator, tableName: String): TerminalOperator = {
+    hiveTerminalOp: HiveOperator, tableName: String,
+    coPartitionTableName: String,
+    partitionColName: String): TerminalOperator = {
     val terminalOp = _newOperatorInstance(
       classOf[CacheSinkOperator], hiveTerminalOp).asInstanceOf[CacheSinkOperator]
     terminalOp.tableName = tableName
+    terminalOp.coPartitionTableName = coPartitionTableName
+    terminalOp.partitionColName = partitionColName
     _createAndSetParents(
       terminalOp, hiveTerminalOp.getParentOperators).asInstanceOf[TerminalOperator]
   }

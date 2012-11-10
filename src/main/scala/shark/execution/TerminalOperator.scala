@@ -4,10 +4,14 @@ import java.util.Date
 
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.hadoop.io.Text
+import org.apache.hadoop.io.Writable
 import org.apache.hadoop.io.BytesWritable
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.ql.exec.{FileSinkOperator => HiveFileSinkOperator, JobCloseFeedBack}
 import org.apache.hadoop.hive.serde2.Serializer
+import org.apache.hadoop.hive.serde2.SerDe
+import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector
+import org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe
 import org.apache.hadoop.mapred.{TaskID, TaskAttemptID, HadoopWriter}
 
 import scala.collection.Map
@@ -19,6 +23,9 @@ import shark.memstore._
 import spark.{GrowableAccumulableParam, RDD, TaskContext}
 import spark.EnhancedRDD._
 import spark.SparkContext._
+import spark.HashPartitioner
+import spark.rdd.ShuffledRDD
+import spark.SparkEnv
 
 
 /**
@@ -162,6 +169,8 @@ class CacheSinkOperator(@BeanProperty var tableName: String)
   extends TerminalOperator {
 
   @BeanProperty var initialColumnSize: Int = _
+  @BeanProperty var coPartitionTableName: String = _
+  @BeanProperty var partitionColName: String = _
 
   // Zero-arg constructor for deserialization.
   def this() = this(null)
@@ -176,27 +185,93 @@ class CacheSinkOperator(@BeanProperty var tableName: String)
     localHconf.setInt(SharkConfVars.COLUMN_INITIALSIZE.varname, initialColumnSize)
   }
 
+  def getCacheLocs(rdd: RDD[_]): Array[Seq[String]] = {
+    // Return the first location for each partition
+    SparkEnv.get.cacheTracker.getLocationsSnapshot()(rdd.id).map(x => x.toSeq)
+  }
+
   override def execute(): RDD[_] = {
     val inputRdd = if (parentOperators.size == 1) executeParents().head._2 else null
 
     val statsAcc = SharkEnv.sc.accumulableCollection(ArrayBuffer[(Int, TableStats)]())
     val op = OperatorSerializationWrapper(this)
+    val shouldPartition = partitionColName != ""
+
+    // partition here
+    val rddToCache = if (shouldPartition) {
+      // Check if we should CoPartition this table according to another table
+      val (partitioner, locations) = 
+        SharkEnv.cache.get(CacheKey(coPartitionTableName)) match {
+          case Some(coRdd) => {
+            coRdd.partitioner match {
+              case Some(partitioner) => (partitioner, getCacheLocs(coRdd))
+              case _ => {
+                op.logInfo("no partitioner found in existing Rdd")
+                (new HashPartitioner(SharkConfVars.getIntVar(localHconf, 
+                   SharkConfVars.NUM_COPARTITIONS)), null)
+              }
+            }
+          }
+          case _ => {
+            (new HashPartitioner(SharkConfVars.getIntVar(localHconf,
+               SharkConfVars.NUM_COPARTITIONS)), null)
+          }
+      }
+      // Need to create K,V form of the rdd we are caching
+      val kvRdd = inputRdd.mapPartitions { rowIter =>
+        op.initializeOnSlave()
+
+        val sois = op.objectInspector.asInstanceOf[StructObjectInspector]
+        val structField = sois.getStructFieldRef(op.partitionColName)
+
+        val serde = new BinarySortableSerDe()
+        serde.initialize(op.hconf, op.localHiveOp.getConf.getTableInfo.getProperties)
+
+        rowIter.map { row => 
+          val k = sois.getStructFieldData(row, structField)
+          val value = serde.serialize(row, op.objectInspector).asInstanceOf[BytesWritable]
+          val valueArr = new Array[Byte](value.getLength)
+
+          // TODO(rxin): we don't need to copy bytes if we get rid of Spark block
+          // manager's double buffering.
+          Array.copy(value.getBytes, 0, valueArr, 0, value.getLength)
+          (k, valueArr)
+        }
+      }
+
+      kvRdd.partitionByWithLocations(partitioner, false, locations).map(x => x._2)
+    } else {
+      inputRdd
+    }
 
     // Serialize the RDD on all partitions before putting it into the cache.
-    val rdd = inputRdd.mapPartitionsWithSplit { case(split, iter) =>
+    val rdd = rddToCache.mapPartitionsWithSplit({ case(split, iter) =>
       op.initializeOnSlave()
 
       val serdeClass = op.localHiveOp.getConf.getTableInfo.getDeserializerClass
       op.logInfo("Using serde: " + serdeClass)
       val serde = serdeClass.newInstance().asInstanceOf[ColumnarSerDe]
       serde.initialize(op.hconf, op.localHiveOp.getConf.getTableInfo.getProperties())
-
       val rddSerialzier = new RDDSerializer(serde)
-      val iterToReturn = rddSerialzier.serialize(iter, op.objectInspector)
+
+      val (iterToUse, ois) = if (shouldPartition) {
+        val serdeDeserialize = new BinarySortableSerDe()
+        serdeDeserialize.initialize(op.hconf, op.localHiveOp.getConf.getTableInfo.getProperties)
+        val bw = new BytesWritable()
+        val mappedIter = iter.map { x =>
+          bw.set(x.asInstanceOf[Array[Byte]], 0, x.asInstanceOf[Array[Byte]].length)
+          serdeDeserialize.deserialize(bw)
+        }
+        (mappedIter, serdeDeserialize.getObjectInspector)
+      } else {
+        (iter, op.objectInspector)
+      }
+
+      val iterToReturn = rddSerialzier.serialize(iterToUse, ois)
 
       statsAcc += (split, serde.stats)
       iterToReturn
-    }
+    }, true)
 
     // Put the RDD in cache and force evaluate it.
     val cacheKey = new CacheKey(tableName)

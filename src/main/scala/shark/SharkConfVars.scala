@@ -66,6 +66,8 @@ object SharkConfVars {
     })
   }
 
+  val NUM_COPARTITIONS = new ConfVar("shark.num.copartitions", 5)
+
   // Add Shark configuration variables and their default values to the given conf,
   // so default values show up in 'set'.
   def initializeWithDefaults(conf: Configuration) {
