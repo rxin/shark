@@ -122,33 +122,13 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
 
     logInfo("Executing broadcast join (auto converted).")
 
-    // Collect the small tables.
-    val fetcher = SparkEnv.get.shuffleFetcher
-    val broadcastedTables: Seq[(Broadcast[ArrayBuffer[(ReduceKey, Any)]], Int)] =
-      rddRuns.zipWithIndex.filter(_._2 != bigTableIndex).map { case(rddRun, index) =>
-        val dep = rddRun.dep
-        val shuffleId = dep.shuffleId
-        val table = new ArrayBuffer[(ReduceKey, Any)]
-
-        val startTime = System.currentTimeMillis()
-        fetcher.fetchMultiple[ReduceKey, Any](
-          shuffleId, Array.range(0, NUM_REDUCERS)).foreach { pair =>
-          table += pair
-        }
-        val endTime = System.currentTimeMillis()
-
-        logInfo("Fetching table (size: %d) took %d ms".format(
-          rddRun.sizes.sum, endTime - startTime))
-
-        (SharkEnv.sc.broadcast(table), index)
-      }
-
     val bigTableRdd = new CoalescedBlockRDD[(ReduceKey, Any)](
       rddsInJoinOrder(bigTableIndex).context,
       rddRuns(bigTableIndex).dep.shuffleId)
 
     val op = OperatorSerializationWrapper(this)
     val numRdds = numTables
+    val shuffleIds = rddRuns.map(_.dep.shuffleId)
 
     bigTableRdd.mapPartitions { part =>
 
@@ -162,9 +142,11 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
         values
       }
 
-      broadcastedTables.foreach { case(table, tableIndex) =>
-        table.value.foreach { case(key, value) =>
-          getSeq(key)(tableIndex) += value
+      // Fetch the small small tables:
+      val fetcher = SparkEnv.get.shuffleFetcher
+      shuffleIds.zipWithIndex.filter(_._2 != bigTableIndex).map { case(shuffleId, index) =>
+        fetcher.fetchMultiple[ReduceKey, Any](shuffleId, Array.range(0, NUM_REDUCERS)).foreach { case(key, value) =>
+          getSeq(key)(index) += value
         }
       }
 
@@ -172,7 +154,6 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
 
       op.initializeOnSlave()
 
-      val tmp = new Array[Object](2)
       val writable = new BytesWritable
       val nullSafes = op.conf.getNullSafes()
 
