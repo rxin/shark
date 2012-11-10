@@ -199,13 +199,13 @@ with HiveTopOperator {
     val part = new HashPartitioner(NUM_FINE_GRAINED_BUCKETS)
     val pairRdd = rdd.asInstanceOf[RDD[(Any, Any)]]
 
-    val preshuffleResult = pairRdd.preshuffle(part, CountPartitionStatAccumulator)
+    val preshuffleResult = pairRdd.preshuffle(part, Some(CountPartitionStatAccumulator))
 
     val totalBytes = preshuffleResult.sizes.sum
     logInfo("Aggregated size: %d bytes".format(totalBytes))
     logInfo("Fine grained partition sizes: " + preshuffleResult.sizes.toSeq)
-    logInfo("Aggregated records: " + preshuffleResult.customStats.sum)
-    logInfo("Fine grained records: " + preshuffleResult.customStats.toSeq)
+    logInfo("Aggregated records: " + preshuffleResult.customStats.get.sum)
+    logInfo("Fine grained records: " + preshuffleResult.customStats.get.toSeq)
 
     // Make a partitioning decision based on statistics.
     val numCoalescedPartitions = {
