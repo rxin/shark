@@ -26,6 +26,8 @@ import spark.SparkContext._
  */
 class GroupByPreShuffleOperator extends UnaryOperator[HiveGroupByOperator] {
 
+  override def partitionPreserving = true
+
   @BeanProperty var conf: GroupByDesc = _
   @BeanProperty var minReductionHashAggr: Float = _
   @BeanProperty var numRowsCompareHashAggr: Int = _

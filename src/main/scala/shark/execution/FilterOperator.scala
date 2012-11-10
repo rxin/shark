@@ -11,6 +11,8 @@ import scala.reflect.BeanProperty
 
 class FilterOperator extends UnaryOperator[HiveFilterOperator] {
 
+  override def partitionPreserving = true
+
   @transient var conditionEvaluator: ExprNodeEvaluator = _
   @transient var conditionInspector: PrimitiveObjectInspector = _
 

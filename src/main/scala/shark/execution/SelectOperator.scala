@@ -12,6 +12,8 @@ import scala.reflect.BeanProperty
  */
 class SelectOperator extends UnaryOperator[HiveSelectOperator] {
 
+  override def partitionPreserving = true
+
   @BeanProperty var conf: SelectDesc = _
 
   @transient var evals: Array[ExprNodeEvaluator] = _

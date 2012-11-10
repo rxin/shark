@@ -40,21 +40,21 @@ object RDDUtils {
     val combinedRdd = partialSortedRdd.map { (0.toByte, _) }.combineByKey[ArrayBuffer[(K, V)]](
       createCombiner _, mergeValue _, mergeCombiners _, 1)
 
-    combinedRdd.mapPartitions { iter =>
+    combinedRdd.mapPartitions({ iter =>
       if (iter.hasNext)
         iter.next._2.toIterator
       else
         Iterator[(K,V)]()
-    }
+    }, true)
   }
 
   def partialSortLeastKByKey[K <% Ordered[K]: ClassManifest, V: ClassManifest](
     rdd: RDD[(K,V)],
     k: Int)
   : RDD[(K,V)] = {
-    rdd.mapPartitions { iter =>
+    rdd.mapPartitions({ iter =>
       sortLeastKByKey(iter.toIterable, k).iterator
-    }
+    }, true)
   }
 
   def sortLeastKByKey[K <% Ordered[K]: ClassManifest, V: ClassManifest](

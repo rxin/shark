@@ -89,29 +89,89 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
       logError("rdds.size (%d) != rddsJavaMap.size (%d)".format(rdds.size, rddsJavaMap.size))
     })
 
-    val rddsInJoinOrder = order.map { inputIndex =>
-      rddsJavaMap.get(inputIndex.byteValue.toInt).asInstanceOf[RDD[(ReduceKey, Any)]]
-    }
+    println("partitioners:")
+    println(rdds.map(_._2.partitioner))
+    println(rdds.map(_._2))
 
-    // Force execute the DAG before the join.
-    val rddRuns = rddsInJoinOrder.map(_.preshuffle(new HashPartitioner(NUM_REDUCERS)))
+    val rdd1 = rdds(0)._2.asInstanceOf[RDD[(_, _)]]
+    val rdd2 = rdds(1)._2.asInstanceOf[RDD[(_, _)]]
+    val part1 = rdd1.partitioner
+    val part2 = rdd2.partitioner
+    // val rdd1locs = SharkEnv.getCacheLocs(rdd1)
+    // val rdd2locs = SharkEnv.getCacheLocs(rdd2)
 
-    // Size of the join inputs.
-    val inputSizes = rddRuns.map(_.sizes.sum)
-    logInfo("Input table sizes: " + inputSizes.toSeq)
+    // rdd1locs zip rdd2locs map { case(split1, split2) =>
+    //   logInfo(split1 + " " + split2)
+    //   assert(split1 == split2)
+    // }
 
-    val autoConvertMapJoin: Boolean = hconf.getBoolVar(HiveConf.ConfVars.HIVECONVERTJOIN)
+    if (part1 == part2) {
 
-    val smallTableSize: Long = hconf.getLongVar(HiveConf.ConfVars.HIVESMALLTABLESFILESIZE)
-    val smallTables = inputSizes.zipWithIndex.filter(_._1 < smallTableSize)
-    logInfo("Converting to map join if table is smaller than " +
-      Utils.memoryBytesToString(smallTableSize))
+      import spark.OneToOneDependency
 
-    if (autoConvertMapJoin && smallTables.size >= numTables - 1) {
-      val bigTableIndex = inputSizes.zipWithIndex.max._2
-      broadcastJoin(rddsInJoinOrder, rddRuns, bigTableIndex)
+      val cogrouped = new CoGroupedRDD[ReduceKey](Seq(rdd1, rdd2), part1.get,
+        List(new OneToOneDependency(rdd1), new OneToOneDependency(rdd2)))
+
+      logInfo("cogroup splits : " + cogrouped.splits.toSeq)
+
+      val op = OperatorSerializationWrapper(this)
+
+      cogrouped.mapPartitions { part =>
+        op.initializeOnSlave()
+
+        val tmp = new Array[Object](2)
+        val writable = new BytesWritable
+        val nullSafes = op.conf.getNullSafes()
+
+        val cp = new CartesianProduct[Any](op.numTables)
+
+        part.flatMap { case (k: ReduceKey, bufs: Array[_]) =>
+          writable.set(k.bytes)
+
+          // If nullCheck is false, we can skip deserializing the key.
+          if (op.nullCheck &&
+              SerDeUtils.hasAnyNullObject(
+                op.keyDeserializer.deserialize(writable).asInstanceOf[JList[_]],
+                op.keyObjectInspector,
+                nullSafes)) {
+            bufs.zipWithIndex.flatMap { case (buf, label) =>
+              val bufsNull = Array.fill(op.numTables)(ArrayBuffer[Any]())
+              bufsNull(label) = buf
+              op.generateTuples(cp.product(bufsNull.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+            }
+          } else {
+            op.generateTuples(cp.product(bufs.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+          }
+        }
+      }
+
     } else {
-      cogroupJoin(rddsInJoinOrder, rddRuns)
+
+      val rddsInJoinOrder = order.map { inputIndex =>
+        rddsJavaMap.get(inputIndex.byteValue.toInt).asInstanceOf[RDD[(ReduceKey, Any)]]
+      }
+
+      // Force execute the DAG before the join.
+      val rddRuns = rddsInJoinOrder.map(_.preshuffle(new HashPartitioner(NUM_REDUCERS)))
+
+      // Size of the join inputs.
+      val inputSizes = rddRuns.map(_.sizes.sum)
+      logInfo("Input table sizes: " + inputSizes.toSeq)
+
+      val autoConvertMapJoin: Boolean = hconf.getBoolVar(HiveConf.ConfVars.HIVECONVERTJOIN)
+
+      val smallTableSize: Long = hconf.getLongVar(HiveConf.ConfVars.HIVESMALLTABLESFILESIZE)
+      val smallTables = inputSizes.zipWithIndex.filter(_._1 < smallTableSize)
+      logInfo("Converting to map join if table is smaller than " +
+        Utils.memoryBytesToString(smallTableSize))
+
+      if (autoConvertMapJoin && smallTables.size >= numTables - 1) {
+        val bigTableIndex = inputSizes.zipWithIndex.max._2
+        broadcastJoin(rddsInJoinOrder, rddRuns, bigTableIndex)
+      } else {
+        cogroupJoin(rddsInJoinOrder, rddRuns)
+      }
+
     }
   }
 

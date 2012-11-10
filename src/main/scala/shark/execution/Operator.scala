@@ -15,6 +15,8 @@ import spark.RDD
 
 abstract class Operator[T <: HiveOperator] extends LogHelper with Serializable {
 
+  def partitionPreserving = false
+
   /**
    * Initialize the operator on master node. This can have dependency on other
    * nodes. When an operator's initializeOnMaster() is invoked, all its parents'
@@ -130,7 +132,7 @@ abstract class NaryOperator[T <: HiveOperator] extends Operator[T] {
   override def execute(): RDD[_] = {
     val inputRdds = executeParents()
     val singleRdd = combineMultipleRdds(inputRdds)
-    val rddProcessed = Operator.executeProcessPartition(this, singleRdd)
+    val rddProcessed = Operator.executeProcessPartition(this, singleRdd, partitionPreserving)
     postprocessRdd(rddProcessed)
   }
 
@@ -169,8 +171,10 @@ abstract class UnaryOperator[T <: HiveOperator] extends Operator[T] {
 
   override def execute(): RDD[_] = {
     val inputRdd = if (parentOperators.size == 1) executeParents().head._2 else null
+    if (inputRdd != null)
+      logInfo("parent rdd " + inputRdd + " partitioner " + inputRdd.partitioner)
     val rddPreprocessed = preprocessRdd(inputRdd)
-    val rddProcessed = Operator.executeProcessPartition(this, rddPreprocessed)
+    val rddProcessed = Operator.executeProcessPartition(this, rddPreprocessed, partitionPreserving)
     postprocessRdd(rddProcessed)
   }
 }
@@ -189,9 +193,14 @@ object Operator extends LogHelper {
    * to do logging, but calling logging automatically adds a reference to the
    * operator (which is not serializable by Java) in the Spark closure.
    */
-  def executeProcessPartition(operator: Operator[_ <: HiveOperator], rdd: RDD[_]): RDD[_] = {
+  def executeProcessPartition(
+    operator: Operator[_ <: HiveOperator],
+    rdd: RDD[_],
+    partitionPreserving: Boolean = false)
+  : RDD[_] = {
+
     val op = OperatorSerializationWrapper(operator)
-    rdd.mapPartitionsWithSplit { case(split, partition) =>
+    rdd.mapPartitionsWithSplit({ case(split, partition) =>
       op.logDebug("Started executing mapPartitions for operator: " + op)
       op.logDebug("Input object inspectors: " + op.objectInspectors)
 
@@ -200,7 +209,7 @@ object Operator extends LogHelper {
       op.logDebug("Finished executing mapPartitions for operator: " + op)
 
       newPart
-    }
+    }, partitionPreserving)
   }
 
 }

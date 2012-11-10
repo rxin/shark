@@ -93,7 +93,7 @@ class TableScanOperator extends TopOperator[HiveTableScanOperator] with HiveTopO
   }
 
   def loadRddFromCache(tableKey: CacheKey, rdd: RDD[_]): RDD[_] = {
-    logInfo("Loading table from cache " + tableKey)
+    logInfo("Loading table from cache " + tableKey + " with partitioner: " + rdd.partitioner)
 
     // Stats used for map pruning.
     val splitToStats: collection.Map[Int, TableStats] = SharkEnv.cache.keyToStats(tableKey)
@@ -132,14 +132,14 @@ class TableScanOperator extends TopOperator[HiveTableScanOperator] with HiveTopO
         rdd
       }
 
-    prunedRdd.mapPartitions { iter =>
+    prunedRdd.mapPartitions({ iter =>
       if (iter.hasNext) {
         val tableStorage = iter.next.asInstanceOf[TableStorage]
         tableStorage.iterator
       } else {
         Iterator()
       }
-    }
+    }, true)
   }
 
   /**

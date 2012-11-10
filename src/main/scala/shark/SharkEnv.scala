@@ -5,6 +5,8 @@ import org.apache.hadoop.hive.conf.HiveConf
 import scala.collection.mutable.{HashMap, HashSet}
 import shark.memstore.CacheManager
 import spark.SparkContext
+import spark.RDD
+import spark.SparkEnv
 
 /** A singleton object for the master program. The slaves should not access this. */
 object SharkEnv extends LogHelper {
@@ -75,6 +77,11 @@ object SharkEnv extends LogHelper {
     if (SharkEnv.sc != null) {
       sc.stop()
     }
+  }
+
+  def getCacheLocs(rdd: RDD[_]): Array[Seq[String]] = {
+    // Return the first location for each partition
+    SparkEnv.get.cacheTracker.getLocationsSnapshot()(rdd.id).map(x => x.toSeq)
   }
 
   def getEnv(variable: String) =

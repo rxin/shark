@@ -185,11 +185,6 @@ class CacheSinkOperator(@BeanProperty var tableName: String)
     localHconf.setInt(SharkConfVars.COLUMN_INITIALSIZE.varname, initialColumnSize)
   }
 
-  def getCacheLocs(rdd: RDD[_]): Array[Seq[String]] = {
-    // Return the first location for each partition
-    SparkEnv.get.cacheTracker.getLocationsSnapshot()(rdd.id).map(x => x.toSeq)
-  }
-
   override def execute(): RDD[_] = {
     val inputRdd = if (parentOperators.size == 1) executeParents().head._2 else null
 
@@ -198,51 +193,60 @@ class CacheSinkOperator(@BeanProperty var tableName: String)
     val shouldPartition = partitionColName != ""
 
     // partition here
-    val rddToCache = if (shouldPartition) {
-      // Check if we should CoPartition this table according to another table
-      val (partitioner, locations) = 
-        SharkEnv.cache.get(CacheKey(coPartitionTableName)) match {
-          case Some(coRdd) => {
-            coRdd.partitioner match {
-              case Some(partitioner) => (partitioner, getCacheLocs(coRdd))
-              case _ => {
-                op.logInfo("no partitioner found in existing Rdd")
-                (new HashPartitioner(SharkConfVars.getIntVar(localHconf, 
-                   SharkConfVars.NUM_COPARTITIONS)), null)
+    val rddToCache = {
+      if (shouldPartition) {
+        // Check if we should CoPartition this table according to another table
+        val (partitioner, locations) =
+          SharkEnv.cache.get(CacheKey(coPartitionTableName)) match {
+            case Some(coRdd) => {
+              coRdd.partitioner match {
+                case Some(partitioner) => (partitioner, SharkEnv.getCacheLocs(coRdd))
+                case _ => {
+                  op.logInfo("no partitioner found in existing Rdd")
+                  (new HashPartitioner(SharkConfVars.getIntVar(localHconf,
+                     SharkConfVars.NUM_COPARTITIONS)), null)
+                }
               }
             }
+            case _ => {
+              (new HashPartitioner(SharkConfVars.getIntVar(localHconf,
+                 SharkConfVars.NUM_COPARTITIONS)), null)
+            }
           }
-          case _ => {
-            (new HashPartitioner(SharkConfVars.getIntVar(localHconf,
-               SharkConfVars.NUM_COPARTITIONS)), null)
+
+        logInfo("Partitioning %s using partitioner %s on column %s".format(
+          tableName, partitioner, partitionColName))
+
+        // Need to create K,V form of the rdd we are caching
+        val kvRdd = inputRdd.mapPartitions { rowIter =>
+          op.initializeOnSlave()
+
+          val sois = op.objectInspector.asInstanceOf[StructObjectInspector]
+          val structField = sois.getStructFieldRef(op.partitionColName)
+
+          val serde = new BinarySortableSerDe()
+          serde.initialize(op.hconf, op.localHiveOp.getConf.getTableInfo.getProperties)
+
+          rowIter.map { row =>
+            val k = sois.getStructFieldData(row, structField)
+            val value = serde.serialize(row, op.objectInspector).asInstanceOf[BytesWritable]
+            val valueArr = new Array[Byte](value.getLength)
+
+            // TODO(rxin): we don't need to copy bytes if we get rid of Spark block
+            // manager's double buffering.
+            Array.copy(value.getBytes, 0, valueArr, 0, value.getLength)
+            (k, valueArr)
           }
-      }
-      // Need to create K,V form of the rdd we are caching
-      val kvRdd = inputRdd.mapPartitions { rowIter =>
-        op.initializeOnSlave()
-
-        val sois = op.objectInspector.asInstanceOf[StructObjectInspector]
-        val structField = sois.getStructFieldRef(op.partitionColName)
-
-        val serde = new BinarySortableSerDe()
-        serde.initialize(op.hconf, op.localHiveOp.getConf.getTableInfo.getProperties)
-
-        rowIter.map { row => 
-          val k = sois.getStructFieldData(row, structField)
-          val value = serde.serialize(row, op.objectInspector).asInstanceOf[BytesWritable]
-          val valueArr = new Array[Byte](value.getLength)
-
-          // TODO(rxin): we don't need to copy bytes if we get rid of Spark block
-          // manager's double buffering.
-          Array.copy(value.getBytes, 0, valueArr, 0, value.getLength)
-          (k, valueArr)
         }
-      }
 
-      kvRdd.partitionByWithLocations(partitioner, false, locations).map(x => x._2)
-    } else {
-      inputRdd
+        kvRdd.partitionByWithLocations(partitioner, false, locations).mapPartitions(
+          {iter => iter.map(x => x._2)}, true)
+      } else {
+        inputRdd
+      }
     }
+
+    logInfo("rddToCache's partitioner is " + rddToCache.partitioner)
 
     // Serialize the RDD on all partitions before putting it into the cache.
     val rdd = rddToCache.mapPartitionsWithSplit({ case(split, iter) =>

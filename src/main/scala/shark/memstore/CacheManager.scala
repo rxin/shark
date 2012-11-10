@@ -1,14 +1,16 @@
 package shark.memstore
 
+import shark.LogHelper
 import spark.RDD
 
-class CacheManager {
+class CacheManager extends LogHelper {
 
   val keyToRdd = new collection.mutable.HashMap[CacheKey, RDD[_]]()
 
   val keyToStats = new collection.mutable.HashMap[CacheKey, collection.Map[Int, TableStats]]
 
   def put(key: CacheKey, rdd: RDD[_]) {
+    logInfo("Adding " + rdd + " to cache manager. Its partitioner is " + rdd.partitioner)
     keyToRdd(key) = rdd
     rdd.cache()
   }

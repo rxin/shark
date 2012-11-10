@@ -26,6 +26,8 @@ import shark.SharkEnvSlave
  */
 class ReduceSinkOperator extends UnaryOperator[HiveReduceSinkOperator] {
 
+  override def partitionPreserving = true
+
   @BeanProperty var conf: ReduceSinkDesc = _
 
   // The evaluator for key columns. Key columns decide the sort/hash order on
