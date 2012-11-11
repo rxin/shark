@@ -225,7 +225,7 @@ class CacheSinkOperator(@BeanProperty var tableName: String)
           val structField = sois.getStructFieldRef(op.partitionColName)
 
           val serde = new BinarySortableSerDe()
-          SharkEnvSlave.objectInspectorLock.synchronized {
+          shark.SharkEnvSlave.objectInspectorLock.synchronized {
             serde.initialize(op.hconf, op.localHiveOp.getConf.getTableInfo.getProperties)
           }
 
@@ -262,7 +262,7 @@ class CacheSinkOperator(@BeanProperty var tableName: String)
 
       val (iterToUse, ois) = if (shouldPartition) {
         val serdeDeserialize = new BinarySortableSerDe()
-        SharkEnvSlave.objectInspectorLock.synchronized {
+        shark.SharkEnvSlave.objectInspectorLock.synchronized {
           serdeDeserialize.initialize(op.hconf, op.localHiveOp.getConf.getTableInfo.getProperties)
         }
         val bw = new BytesWritable()
