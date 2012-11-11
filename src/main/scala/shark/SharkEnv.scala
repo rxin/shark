@@ -81,7 +81,40 @@ object SharkEnv extends LogHelper {
 
   def getCacheLocs(rdd: RDD[_]): Array[Seq[String]] = {
     // Return the first location for each partition
-    SparkEnv.get.cacheTracker.getLocationsSnapshot()(rdd.id).map(x => x.toSeq)
+    val locations = SparkEnv.get.cacheTracker.getLocationsSnapshot()
+    if (locations != null && locations.contains(rdd.id)) {
+      locations(rdd.id).map(x => x.toSeq)
+    } else {
+      null
+    }
+  }
+
+  def getPreferredLocs(rdd: RDD[_], partition: Int): List[String] = {
+    import spark.NarrowDependency
+
+    // If the partition is cached, return the cache locations
+    val cached = getCacheLocs(rdd)
+    if (cached != null && cached(partition) != null && cached(partition) != Nil) {
+      return cached(partition).toList
+    }
+    // If the RDD has some placement preferences (as is the case for input RDDs), get those
+    val rddPrefs = rdd.preferredLocations(rdd.splits(partition)).toList
+    if (rddPrefs != Nil) {
+      return rddPrefs
+    }
+    // If the RDD has narrow dependencies, pick the first partition of the first narrow dep
+    // that has any placement preferences. Ideally we would choose based on transfer sizes,
+    // but this will do for now.
+    rdd.dependencies.foreach(_ match {
+      case n: NarrowDependency[_] =>
+        for (inPart <- n.getParents(partition)) {
+          val locs = getPreferredLocs(n.rdd, inPart)
+          if (locs != Nil)
+            return locs
+        }
+      case _ =>
+    })
+    return Nil
   }
 
   def getEnv(variable: String) =

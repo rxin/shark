@@ -105,9 +105,17 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
     //   assert(split1 == split2)
     // }
 
-    if (part1 == part2) {
+    if (part1 == part2 && part1 != None) {
 
       import spark.OneToOneDependency
+
+      rdd1.splits.zipWithIndex.foreach { case (split, index) =>
+        println("split #" + index + ": " + SharkEnv.getPreferredLocs(rdd1, index))
+      }
+
+      rdd2.splits.zipWithIndex.foreach { case (split, index) =>
+        println("split #" + index + ": " + SharkEnv.getPreferredLocs(rdd2, index))
+      }
 
       val cogrouped = new CoGroupedRDD[ReduceKey](Seq(rdd1, rdd2), part1.get,
         List(new OneToOneDependency(rdd1), new OneToOneDependency(rdd2)))
