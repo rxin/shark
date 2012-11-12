@@ -11,7 +11,7 @@ import org.apache.hadoop.hive.ql.exec.Utilities.EnumDelegate
 import org.apache.hadoop.hive.ql.plan.GroupByDesc
 import org.apache.hadoop.hive.ql.plan.PlanUtils.ExpressionTypes
 
-import shark.{SharkConfVars, LogHelper}
+import shark.{SharkConfVars, SharkEnvSlave, LogHelper}
 
 
 
@@ -109,9 +109,13 @@ object XmlSerializer {
       } else {
         new ByteArrayInputStream(bytes.slice(1, bytes.size))
       }
-    val d: XMLDecoder = new XMLDecoder(decodedStream, null, null, cl)
-    val ret = d.readObject()
-    d.close()
+
+    val ret = SharkEnvSlave.objectInspectorLock.synchronized {
+      val d: XMLDecoder = new XMLDecoder(decodedStream, null, null, cl)
+      val ret = d.readObject()
+      d.close()
+      ret
+    }
     ret.asInstanceOf[T]
   }
 }
