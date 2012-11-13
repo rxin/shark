@@ -35,7 +35,7 @@ class CoalescedBlockRDD[T: ClassManifest](sc: SparkContext, val shuffleId: Int)
     val blockManager = SparkEnv.get.blockManager
     (0 until numMapOutputs).iterator.flatMap { reduceId: Int =>
       val blockId = "shuffle_%d_%d_%d".format(shuffleId, mapId, reduceId)
-      blockManager.getLocal(blockId) match {
+      blockManager.get(blockId) match {
         case Some(block) => block.asInstanceOf[Iterator[T]]
         case None =>
           throw new Exception("Could not compute split, block " + blockId + " not found")
