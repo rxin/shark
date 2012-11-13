@@ -247,7 +247,7 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
 
       part.flatMap { case(key: ReduceKey, value: Any) =>
 
-        val bufs = map(key)
+        val bufs = map.get(key)
 
         if (bufs == null) {
           Iterator.empty
