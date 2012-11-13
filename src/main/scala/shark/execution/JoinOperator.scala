@@ -247,25 +247,30 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
 
       part.flatMap { case(key: ReduceKey, value: Any) =>
 
-        val bufs = getSeq(key)
-        largeTableBuffer(0) = value
-        bufs(bigTableIndex) = largeTableBuffer
+        val bufs = map(key)
 
-        writable.set(key.bytes)
-
-        // If nullCheck is false, we can skip deserializing the key.
-        if (op.nullCheck &&
-            SerDeUtils.hasAnyNullObject(
-              op.keyDeserializer.deserialize(writable).asInstanceOf[JList[_]],
-              op.keyObjectInspector,
-              nullSafes)) {
-          bufs.zipWithIndex.flatMap { case (buf, label) =>
-            val bufsNull = Array.fill(op.numTables)(ArrayBuffer[Any]())
-            bufsNull(label) = buf
-            op.generateTuples(cp.product(bufsNull.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
-          }
+        if (bufs == null) {
+          Iterator.empty
         } else {
-          op.generateTuples(cp.product(bufs.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+          largeTableBuffer(0) = value
+          bufs(bigTableIndex) = largeTableBuffer
+
+          writable.set(key.bytes)
+
+          // If nullCheck is false, we can skip deserializing the key.
+          if (op.nullCheck &&
+              SerDeUtils.hasAnyNullObject(
+                op.keyDeserializer.deserialize(writable).asInstanceOf[JList[_]],
+                op.keyObjectInspector,
+                nullSafes)) {
+            bufs.zipWithIndex.flatMap { case (buf, label) =>
+              val bufsNull = Array.fill(op.numTables)(ArrayBuffer[Any]())
+              bufsNull(label) = buf
+              op.generateTuples(cp.product(bufsNull.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+            }
+          } else {
+            op.generateTuples(cp.product(bufs.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+          }
         }
       }
     }
