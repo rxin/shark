@@ -162,19 +162,18 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
         rddsJavaMap.get(inputIndex.byteValue.toInt).asInstanceOf[RDD[(ReduceKey, Any)]]
       }
 
-      var joinAlgorithm = 0
-
-      val rdd1run = rdd1.asInstanceOf[RDD[(ReduceKey, Any)]].preshuffle(
+      val rdd2run = rdd2.asInstanceOf[RDD[(ReduceKey, Any)]].preshuffle(
         new HashPartitioner(NUM_REDUCERS))
-      val tableSize = rdd1run.sizes.sum
+      val tableSize = rdd2run.sizes.sum
+      logInfo("second table size " + tableSize + " compared with " + smallTableSize)
       if (tableSize < smallTableSize && autoConvertMapJoin) {
         // do map join without even partitioning the second table.
-        broadcastJoin2(rddsInJoinOrder, Seq(rdd1run, null), 1)
+        broadcastJoin2(rddsInJoinOrder, Seq(null, rdd2run), 0)
 
       } else {
-        val rdd2Run = rdd2.asInstanceOf[RDD[(ReduceKey, Any)]].preshuffle(
+        val rdd1run = rdd1.asInstanceOf[RDD[(ReduceKey, Any)]].preshuffle(
           new HashPartitioner(NUM_REDUCERS))
-        val rddRuns = ArrayBuffer(rdd1run, rdd2Run)
+        val rddRuns = ArrayBuffer(rdd1run, rdd2run)
 
         // Size of the join inputs.
         val inputSizes = rddRuns.map(_.sizes.sum)
