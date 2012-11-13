@@ -155,31 +155,133 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
 
     } else {
 
+      val smallTableSize: Long = hconf.getLongVar(HiveConf.ConfVars.HIVESMALLTABLESFILESIZE)
+      val autoConvertMapJoin: Boolean = hconf.getBoolVar(HiveConf.ConfVars.HIVECONVERTJOIN)
+
       val rddsInJoinOrder = order.map { inputIndex =>
         rddsJavaMap.get(inputIndex.byteValue.toInt).asInstanceOf[RDD[(ReduceKey, Any)]]
       }
 
-      // Force execute the DAG before the join.
-      val rddRuns = rddsInJoinOrder.map(_.preshuffle(new HashPartitioner(NUM_REDUCERS)))
+      var joinAlgorithm = 0
 
-      // Size of the join inputs.
-      val inputSizes = rddRuns.map(_.sizes.sum)
-      logInfo("Input table sizes: " + inputSizes.toSeq)
+      val rdd1run = rdd1.asInstanceOf[RDD[(ReduceKey, Any)]].preshuffle(
+        new HashPartitioner(NUM_REDUCERS))
+      val tableSize = rdd1run.sizes.sum
+      if (tableSize < smallTableSize && autoConvertMapJoin) {
+        // do map join without even partitioning the second table.
+        broadcastJoin2(rddsInJoinOrder, Seq(rdd1run, null), 1)
 
-      val autoConvertMapJoin: Boolean = hconf.getBoolVar(HiveConf.ConfVars.HIVECONVERTJOIN)
-
-      val smallTableSize: Long = hconf.getLongVar(HiveConf.ConfVars.HIVESMALLTABLESFILESIZE)
-      val smallTables = inputSizes.zipWithIndex.filter(_._1 < smallTableSize)
-      logInfo("Converting to map join if table is smaller than " +
-        Utils.memoryBytesToString(smallTableSize))
-
-      if (autoConvertMapJoin && smallTables.size >= numTables - 1) {
-        val bigTableIndex = inputSizes.zipWithIndex.max._2
-        broadcastJoin(rddsInJoinOrder, rddRuns, bigTableIndex)
       } else {
-        cogroupJoin(rddsInJoinOrder, rddRuns)
+        val rdd2Run = rdd2.asInstanceOf[RDD[(ReduceKey, Any)]].preshuffle(
+          new HashPartitioner(NUM_REDUCERS))
+        val rddRuns = ArrayBuffer(rdd1run, rdd2Run)
+
+        // Size of the join inputs.
+        val inputSizes = rddRuns.map(_.sizes.sum)
+        logInfo("Input table sizes: " + inputSizes.toSeq)
+
+
+        val smallTables = inputSizes.zipWithIndex.filter(_._1 < smallTableSize)
+        logInfo("Converting to map join if table is smaller than " +
+          Utils.memoryBytesToString(smallTableSize))
+
+        if (autoConvertMapJoin && smallTables.size >= numTables - 1) {
+          val bigTableIndex = inputSizes.zipWithIndex.max._2
+          broadcastJoin(rddsInJoinOrder, rddRuns, bigTableIndex)
+        } else {
+          cogroupJoin(rddsInJoinOrder, rddRuns)
+        }
+      }
+    }
+  }
+
+
+  def broadcastJoin2(
+    rddsInJoinOrder: Seq[RDD[(ReduceKey, Any)]],
+    rddRuns: Seq[PreshuffleResult[_, _, _, _]],
+    bigTableIndex: Int): RDD[_] = {
+
+    logInfo("Executing broadcast join 2 (auto converted).")
+
+    // Collect the small tables.
+    val fetcher = SparkEnv.get.shuffleFetcher
+    val broadcastedTables: Seq[(Broadcast[ArrayBuffer[(ReduceKey, Any)]], Int)] =
+      rddRuns.zipWithIndex.filter(_._2 != bigTableIndex).map { case(rddRun, index) =>
+        val dep = rddRun.dep
+        val shuffleId = dep.shuffleId
+        val table = new ArrayBuffer[(ReduceKey, Any)]
+
+        val startTime = System.currentTimeMillis()
+        fetcher.fetchMultiple[ReduceKey, Any](
+          shuffleId, Array.range(0, NUM_REDUCERS)).foreach { pair =>
+          table += pair
+        }
+        val endTime = System.currentTimeMillis()
+
+        logInfo("Fetching table (size: %d) took %d ms".format(
+          rddRun.sizes.sum, endTime - startTime))
+
+        (SharkEnv.sc.broadcast(table), index)
       }
 
+    val op = OperatorSerializationWrapper(this)
+    val numRdds = numTables
+
+    rddsInJoinOrder(bigTableIndex).mapPartitions { part =>
+
+      val map = new JHashMap[ReduceKey, Array[ArrayBuffer[Any]]]
+      def getSeq(k: ReduceKey): Array[ArrayBuffer[Any]] = {
+        var values = map.get(k)
+        if (values == null) {
+          values = Array.fill(numRdds)(new ArrayBuffer[Any])
+          map.put(k, values)
+        }
+        values
+      }
+
+      broadcastedTables.foreach { case(table, tableIndex) =>
+        table.value.foreach { case(key, value) =>
+          getSeq(key)(tableIndex) += value
+        }
+      }
+
+      val cp = new CartesianProduct[Any](op.numTables)
+      op.initializeOnSlave()
+
+      val tmp = new Array[Object](2)
+      val writable = new BytesWritable
+      val nullSafes = op.conf.getNullSafes()
+      val largeTableBuffer = new ArrayBuffer[Any](1)
+      largeTableBuffer += null
+
+      part.flatMap { case(key: ReduceKey, value: Any) =>
+
+        val bufs = map.get(key)
+
+        if (bufs == null) {
+          Iterator.empty
+        } else {
+          largeTableBuffer(0) = value
+          bufs(bigTableIndex) = largeTableBuffer
+
+          writable.set(key.bytes)
+
+          // If nullCheck is false, we can skip deserializing the key.
+          if (op.nullCheck &&
+              SerDeUtils.hasAnyNullObject(
+                op.keyDeserializer.deserialize(writable).asInstanceOf[JList[_]],
+                op.keyObjectInspector,
+                nullSafes)) {
+            bufs.zipWithIndex.flatMap { case (buf, label) =>
+              val bufsNull = Array.fill(op.numTables)(ArrayBuffer[Any]())
+              bufsNull(label) = buf
+              op.generateTuples(cp.product(bufsNull.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+            }
+          } else {
+            op.generateTuples(cp.product(bufs.asInstanceOf[Array[Seq[Any]]], op.joinConditions))
+          }
+        }
+      }
     }
   }
 
