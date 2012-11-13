@@ -236,18 +236,22 @@ class JoinOperator extends CommonJoinOperator[JoinDesc, HiveJoinOperator]
         }
       }
 
-      part.foreach { case(key: ReduceKey, value: Any) => getSeq(key)(bigTableIndex) += value }
-
+      val cp = new CartesianProduct[Any](op.numTables)
       op.initializeOnSlave()
 
       val tmp = new Array[Object](2)
       val writable = new BytesWritable
       val nullSafes = op.conf.getNullSafes()
+      val largeTableBuffer = new ArrayBuffer[Any](1)
+      largeTableBuffer += null
 
-      val cp = new CartesianProduct[Any](op.numTables)
+      part.flatMap { case(key: ReduceKey, value: Any) =>
 
-      map.iterator.flatMap { case (k: ReduceKey, bufs: Array[_]) =>
-        writable.set(k.bytes)
+        val bufs = getSeq(key)
+        largeTableBuffer(0) = value
+        bufs(bigTableIndex) = largeTableBuffer
+
+        writable.set(key.bytes)
 
         // If nullCheck is false, we can skip deserializing the key.
         if (op.nullCheck &&
